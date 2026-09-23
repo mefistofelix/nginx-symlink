@@ -12,10 +12,17 @@ static unsigned calls, grant = 1, lookup_ok = 1, usable = 1;
 static unsigned owner_bits, group_bits = 4, other_bits;
 
 void
-ngx_log_error_core(ngx_uint_t level, ngx_log_t *log, ngx_err_t err,
+ngx_log_error_core(ngx_uint_t level, ngx_log_t *log,
+#ifdef ngx_src_file
+    const char *filename,
+#endif
+    ngx_err_t err,
     const char *fmt, ...)
 {
     (void) level; (void) log; (void) err; (void) fmt;
+#ifdef ngx_src_file
+    (void) filename;
+#endif
 }
 
 ngx_fd_t ngx_sa_open_root(ngx_str_t *root)

@@ -2,7 +2,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 if [[ "${RUNNER_OS:-$(uname -s)}" == Windows || "$OSTYPE" == msys* ]]; then
-    export PATH="/c/Strawberry/perl/bin:$PATH"
+    export PATH="$(dirname "$(command -v cl)"):/c/Strawberry/perl/bin:$PATH"
     python tools/build_release.py windows
 else
     sudo apt-get update -qq
