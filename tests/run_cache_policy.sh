@@ -8,6 +8,7 @@ cc -O1 -g -ffunction-sections -fdata-sections -Wall -Wextra \
    -Wno-unused-parameter -Werror -fsanitize=address,undefined \
    -I "$src/objs" -I "$src/src/core" -I "$src/src/os/unix" \
    -I "$src/src/event" -I "$src/src/event/modules" \
+   -I "$src/src/event/quic" \
    "$tests/cache_policy.c" "$src/src/core/ngx_symlink_access.c" \
    "$src/src/core/ngx_palloc.c" "$src/src/core/ngx_rbtree.c" \
    "$src/src/core/ngx_string.c" "$src/src/core/ngx_crc32.c" \

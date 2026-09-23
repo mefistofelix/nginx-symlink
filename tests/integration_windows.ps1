@@ -14,12 +14,12 @@ public static class SymlinkAccessTestAcl {
     [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
     [return: MarshalAs(UnmanagedType.U1)]
     public static extern bool CreateSymbolicLinkW(string link, string target, uint flags);
-    public static void Set(string path, string sddl) {
+    public static void Set(string path, string sddl, uint flags = 0x80000004) {
         IntPtr sd; uint size;
         if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, 1, out sd, out size))
             throw new Win32Exception(Marshal.GetLastWin32Error());
         try {
-            if (!SetFileSecurityW(path, 0x80000004, sd))
+            if (!SetFileSecurityW(path, flags, sd))
                 throw new Win32Exception(Marshal.GetLastWin32Error());
         } finally { LocalFree(sd); }
     }
@@ -37,6 +37,7 @@ $targets = Join-Path $testRoot 'targets'
 [IO.Directory]::CreateDirectory($targets) | Out-Null
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $sid = $identity.User
+[SymlinkAccessTestAcl]::Set($web, "O:$($sid.Value)", 1)
 $group = New-Object Security.Principal.SecurityIdentifier('S-1-5-32-545')
 $systemSid = New-Object Security.Principal.SecurityIdentifier('S-1-5-18')
 
@@ -49,11 +50,13 @@ function Set-TestAcl([string]$Path, [string]$Kind) {
 foreach ($kind in @('allow', 'deny', 'group')) {
     $path = Join-Path $targets $kind
     [IO.File]::WriteAllText($path, "BODY:$kind")
+    [SymlinkAccessTestAcl]::Set($path, "O:$($sid.Value)", 1)
     Set-TestAcl $path $kind
 }
 foreach ($kind in @('everyone', 'empty', 'null', 'inherit_only')) {
     $path = Join-Path $targets $kind
     [IO.File]::WriteAllText($path, "BODY:$kind")
+    [SymlinkAccessTestAcl]::Set($path, "O:$($sid.Value)", 1)
     $sddl = switch ($kind) {
         'everyone' { 'D:P(A;;FRFX;;;WD)' }
         'empty' { 'D:P' }

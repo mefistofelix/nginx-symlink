@@ -32,7 +32,8 @@ with tempfile.TemporaryDirectory(prefix='sa-abi-') as tmp:
             include = ['-I', str(p)]
         args = ['cc', '-shared', '-fPIC', '-Wall', '-Werror'] + include
         for directory in ['objs', 'src/core', 'src/os/unix', 'src/event',
-                          'src/event/modules', 'src/http', 'src/http/modules']:
+                          'src/event/modules', 'src/event/quic', 'src/http',
+                          'src/http/modules', 'src/http/v2', 'src/http/v3']:
             args += ['-I', str(src / directory)]
         so = p / ('legacy.so' if legacy else 'patched.so')
         subprocess.run(args + [str(p / 'module.c'), '-o', str(so)], check=True)
