@@ -161,10 +161,10 @@ index 8b0bb14..fba02c5 100644
      {
 diff --git a/src/http/modules/ngx_http_symlink_access_module.c b/src/http/modules/ngx_http_symlink_access_module.c
 new file mode 100644
-index 0000000..6c6c4cf
+index 0000000..c52b849
 --- /dev/null
 +++ b/src/http/modules/ngx_http_symlink_access_module.c
-@@ -0,0 +1,516 @@
+@@ -0,0 +1,520 @@
 +/* Targeted symlink access checks. SPDX-License-Identifier: BSD-2-Clause */
 +#include <ngx_config.h>
 +#include <ngx_core.h>
@@ -191,7 +191,11 @@ index 0000000..6c6c4cf
 +    int n;
 +    ngx_sa_gid_t ids[];
 +} ngx_sa_groups_t;
++#if (NGX_HAVE_OPENAT)
 +#define NGX_SA_ROOT_MODE (NGX_FILE_SEARCH|NGX_FILE_NONBLOCK)
++#else
++#define NGX_SA_ROOT_MODE (NGX_FILE_RDONLY|NGX_FILE_NONBLOCK)
++#endif
 +#endif
 +
 +typedef struct {

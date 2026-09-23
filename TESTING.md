@@ -2,11 +2,11 @@
 
 ## Dimensioni della patch ridotta
 
-- 572 righe aggiunte, 7 rimosse, 13 file coinvolti.
-- Un solo file nuovo: modulo di 516 righe, inclusi Unix, Windows e cache.
+- 576 righe aggiunte, 7 rimosse, 13 file coinvolti.
+- Un solo file nuovo: modulo di 520 righe, inclusi Unix, Windows e cache.
 - Nei 12 file esistenti: 56 righe aggiunte e 7 rimosse.
-- 708 righe fisiche nel `.patch`, inclusi intestazioni e contesto.
-- SHA-256: `6262cc297a1dc7c3da4feb2fc2a713b4f4b63cd700fe4d26627110869da1e9e9`.
+- 712 righe fisiche nel `.patch`, inclusi intestazioni e contesto.
+- SHA-256: `f8312ef003b4cab60b4d84879a0a5e4774685c35b3232440e23ef867f43d2192`.
 
 La versione precedente aggiungeva 1081 righe in 17 file, con cinque file nuovi.
 La riduzione elimina i backend separati, le strutture intermedie dei permessi,
@@ -57,6 +57,11 @@ Tutti i job devono riuscire prima della pubblicazione.
 
 La prima release `c566eee04a1b` contiene la versione estesa precedente; consultare
 le release successive e i relativi run per la patch ridotta.
+
+La patch ridotta ha superato anche 291 verifiche HTTP per server su Alpine 3.23
+(musl), e la compilazione forzando l'assenza di `NGX_HAVE_OPENAT`, di
+`NGX_HAVE_GETGROUPLIST` e di entrambe le API. Questi controlli locali non
+equivalgono a esecuzioni su FreeBSD o macOS.
 
 Non sono validati FreeBSD/macOS, domini Active Directory, share SMB o tutti i
 filesystem e reparse provider Windows. Non sono stati effettuati benchmark.

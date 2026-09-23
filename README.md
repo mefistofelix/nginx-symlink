@@ -47,6 +47,8 @@ Unix usa UID, `getpwuid_r`, `getgrouplist` e `fstat`. I bit group dei file con
 ACL POSIX possono rappresentare la maschera ACL: questa policy non sostituisce
 una verifica completa delle ACL. Sono ammessi fino a 4096 gruppi e un record
 utente NSS fino a 16 KiB; lookup mancanti o non rappresentabili negano l'accesso.
+Senza `openat`, le aperture nelle location protette sono negate; senza
+enumerazione dei gruppi, sono negati i file raggiunti tramite symlink.
 
 Windows usa SID, Authz e DACL. Traduce le ACE allow in bit rwx per owner, gruppi
 abilitati ed Everyone. ACE deny applicabili, tipi di ACE non riconosciuti e
