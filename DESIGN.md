@@ -10,6 +10,18 @@ interni, senza contesto globale temporaneo o dati nascosti in campi esistenti.
 Le sostituzioni nei moduli sono piccole, ma vanno mantenute in ogni percorso
 che può inviare un file. I moduli di directory/DAV hanno guardie dedicate.
 
+Gli undici file esistenti modificati comprendono sei moduli che aprono file,
+tre guardie directory/DAV, l'header HTTP e un solo script di compilazione.
+La sonda di index che verifica soltanto la directory usa la funzione originale:
+non invia contenuti e il wrapper non autorizzava le directory. Resta il controllo
+sui file candidati di index e try_files, per conservare il diniego prima del
+redirect e la selezione del fallback. Spostarlo soltanto nel modulo static
+cambierebbe questi comportamenti.
+
+L'apertura core non riceve la richiesta HTTP. Centralizzare lì la policy
+richiederebbe un nuovo passaggio di contesto; controllare soltanto il path prima
+dell'apertura non garantirebbe l'identità del file poi servito.
+
 ## Due operazioni normalizzate
 
 `ngx_sa_user_groups` raccoglie i gruppi del proprietario della webroot.
@@ -36,8 +48,8 @@ dei volumi. Oggetti diversi, reparsing o identità non confrontabile richiedono
 il controllo dei permessi sull'handle servito. Non si riusa un'autorizzazione
 basata su un path precedente o su una voce di `open_file_cache`.
 
-Le directory sono sonde per index/try_files; l'autorizzazione avviene sul file
-finale. Autoindex, random_index e DAV non possono usare questa eccezione per
+Le directory sono sonde per index/try_files; l'autorizzazione riguarda i file.
+Autoindex, random_index e DAV non possono usare questa eccezione per
 leggere o modificare contenuti nelle location protette.
 
 La soluzione è un controllo aggiuntivo mirato, non un isolamento completo dei

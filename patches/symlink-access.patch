@@ -1,5 +1,5 @@
 diff --git a/auto/modules b/auto/modules
-index 3082c8f..0a10ea4 100644
+index 3082c8f..098a841 100644
 --- a/auto/modules
 +++ b/auto/modules
 @@ -84,4 +84,5 @@ if [ $HTTP = YES ]; then
@@ -14,7 +14,7 @@ index 3082c8f..0a10ea4 100644
 +                         src/http/modules/ngx_http_symlink_access_module.c \
                           src/http/ngx_http_special_response.c \
                           src/http/ngx_http_request.c \
-@@ -110,4 +112,11 @@ if [ $HTTP = YES ]; then
+@@ -110,4 +112,26 @@ if [ $HTTP = YES ]; then
          ngx_module_link=YES
  
 +        if [ "$NGX_PLATFORM" = win32 ]; then
@@ -22,39 +22,25 @@ index 3082c8f..0a10ea4 100644
 +                clang | gcc) ngx_module_libs="-lauthz" ;;
 +                *) ngx_module_libs="authz.lib" ;;
 +            esac
++        else
++            ngx_feature="getgrouplist()"
++            ngx_feature_name="NGX_HAVE_GETGROUPLIST"
++            ngx_feature_run=no
++            ngx_feature_incs="#include <sys/types.h>
++                              #include <unistd.h>
++                              #include <grp.h>
++                              #include <pwd.h>"
++            ngx_feature_path=
++            ngx_feature_libs=
++            ngx_feature_test='int n = 0;
++                              struct passwd pw, *result; char buf[4096];
++                              getpwuid_r(0, &pw, buf, sizeof(buf), &result);
++                              getgrouplist("root", 0, NULL, &n)'
++            . auto/feature
 +        fi
 +
          . auto/module
      fi
-diff --git a/auto/unix b/auto/unix
-index 4e85090..3844977 100644
---- a/auto/unix
-+++ b/auto/unix
-@@ -1021,4 +1021,24 @@ ngx_feature_test="struct stat sb;
- 
- 
-+ngx_feature="getgrouplist()"
-+ngx_feature_name="NGX_HAVE_GETGROUPLIST"
-+ngx_feature_run=no
-+ngx_feature_incs="#include <sys/types.h>
-+                  #include <unistd.h>
-+                  #include <grp.h>
-+                  #include <pwd.h>"
-+ngx_feature_path=
-+ngx_feature_libs=
-+ngx_feature_test='int n = 1;
-+#if defined(__APPLE__)
-+                  int groups[1];
-+#else
-+                  gid_t groups[1];
-+#endif
-+                  struct passwd pw, *result; char buf[4096];
-+                  getpwuid_r(0, &pw, buf, sizeof(buf), &result);
-+                  getgrouplist("root", 0, groups, &n)'
-+. auto/feature
-+
- ngx_feature="getaddrinfo()"
- ngx_feature_name="NGX_HAVE_GETADDRINFO"
 diff --git a/src/http/modules/ngx_http_autoindex_module.c b/src/http/modules/ngx_http_autoindex_module.c
 index 8f594d1..07045b3 100644
 --- a/src/http/modules/ngx_http_autoindex_module.c
@@ -107,7 +93,7 @@ index 91b38d1..f560608 100644
          != NGX_OK)
      {
 diff --git a/src/http/modules/ngx_http_index_module.c b/src/http/modules/ngx_http_index_module.c
-index 149b447..9ed0274 100644
+index 149b447..77ada99 100644
 --- a/src/http/modules/ngx_http_index_module.c
 +++ b/src/http/modules/ngx_http_index_module.c
 @@ -226,5 +226,5 @@ ngx_http_index_handler(ngx_http_request_t *r)
@@ -117,13 +103,6 @@ index 149b447..9ed0274 100644
 +        if (ngx_http_symlink_open_cached_file(r, clcf->open_file_cache, &path, &of, r->pool)
              != NGX_OK)
          {
-@@ -325,5 +325,5 @@ ngx_http_index_test_dir(ngx_http_request_t *r, ngx_http_core_loc_conf_t *clcf,
-     }
- 
--    if (ngx_open_cached_file(clcf->open_file_cache, &dir, &of, r->pool)
-+    if (ngx_http_symlink_open_cached_file(r, clcf->open_file_cache, &dir, &of, r->pool)
-         != NGX_OK)
-     {
 diff --git a/src/http/modules/ngx_http_mp4_module.c b/src/http/modules/ngx_http_mp4_module.c
 index 0ccdf13..08046a8 100644
 --- a/src/http/modules/ngx_http_mp4_module.c

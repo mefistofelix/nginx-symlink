@@ -63,7 +63,8 @@ dei file vengono riletti. Una revoca di gruppo può impiegare fino al TTL per
 diventare effettiva nella policy.
 Un lookup NSS/AD lento può bloccare il worker quando manca in cache.
 
-Per i percorsi protetti, `open_file_cache` non viene usata. Unix riusa l'apertura
+Per le aperture di file protetti, `open_file_cache` non viene usata. La sola
+sonda della directory di index conserva la cache originale. Unix riusa l'apertura
 senza symlink del server. Windows usa `OBJ_DONT_REPARSE`, mantiene aperto il
 descriptor di confronto e confronta volume e ID file a 128 bit con il file
 aperto dal server. Se il percorso cambia oggetto, controlla i permessi del

@@ -2,16 +2,21 @@
 
 ## Dimensioni della patch ridotta
 
-- 576 righe aggiunte, 7 rimosse, 13 file coinvolti.
+- 570 righe aggiunte, 6 rimosse, 12 file coinvolti.
 - Un solo file nuovo: modulo di 520 righe, inclusi Unix, Windows e cache.
-- Nei 12 file esistenti: 56 righe aggiunte e 7 rimosse.
-- 712 righe fisiche nel `.patch`, inclusi intestazioni e contesto.
-- SHA-256: `f8312ef003b4cab60b4d84879a0a5e4774685c35b3232440e23ef867f43d2192`.
+- Negli 11 file esistenti: 50 righe aggiunte e 6 rimosse.
+- 691 righe fisiche nel `.patch`, inclusi intestazioni e contesto.
+- SHA-256: `ed15eb37c1c47cc4f9cdb6982d3217b45b0cab8d568c96ed3c48d780db1f8093`.
 
 La versione precedente aggiungeva 1081 righe in 17 file, con cinque file nuovi.
 La riduzione elimina i backend separati, le strutture intermedie dei permessi,
 il resolver Unix duplicato, le direttive opzionali e la cache negativa.
 Non si tratta di codice spostato fuori dalla patch.
+
+Rispetto alla prima versione minima, `auto/unix` non viene più modificato:
+il test delle API dei gruppi è accanto alla registrazione del modulo in
+`auto/modules`. È rimossa anche la chiamata aggiuntiva nella sonda delle
+directory di index. Restano sei chiamate per i file e tre guardie directory/DAV.
 
 ## Applicazione e ABI
 
