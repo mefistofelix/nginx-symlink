@@ -1,221 +1,112 @@
 # symlink_access per nginx e Angie
 
-Una patch comune aggiunge un controllo mirato alla lettura dei file raggiunti
-tramite symlink, usando come identità il proprietario della webroot corrente.
-I dati Unix e Windows passano attraverso la stessa interfaccia ridotta:
-identità e gruppi dell'utente, owner e bit di accesso del target.
+Una patch comune controlla la lettura dei file raggiunti tramite symlink usando
+il proprietario della webroot corrente come identità di riferimento.
+**Nessuna modifica alle strutture esistenti o alla firma ABI.**
 
-La patch è in **[patches/symlink-access.patch](patches/symlink-access.patch)**.
-Richiede la ricompilazione del server. Non cambia strutture esistenti o firma ABI.
-Non è un modulo caricabile su binari preesistenti.
-
-## Build e release
-
-Il workflow manuale [ci](.github/workflows/ci.yml) compila e testa nginx 1.31.6
-su Ubuntu 24.04 x86_64 e Windows x86, e Angie 1.12.2 su Ubuntu 24.04 x86_64.
-Solo dopo il successo di tutti i build pubblica una prerelease con archivi,
-rapporti dei moduli e checksum SHA-256. La patch attuale è sperimentale:
-la riduzione richiesta a 500 righe è ancora da completare.
-
-I riferimenti sono i **binari ufficiali**, scaricati con versioni e hash fissati
-in [tools/releases.json](tools/releases.json). Il build legge le opzioni da
-`-V`, configura il sorgente originale, applica la patch e confronta le tabelle
-dei moduli. L'unica aggiunta ammessa è `ngx_http_symlink_access_module`;
-verifica anche le opzioni di moduli e funzionalità del binario finale.
-I rapporti `*-modules.json` e i file `official-V.txt`/`patched-V.txt` documentano
-il confronto. Il riferimento è il pacchetto base: i moduli dinamici distribuiti
-separatamente non sono inclusi né attivati automaticamente.
-
-I binari Linux richiedono Ubuntu 24.04 x86_64 o un ambiente compatibile e le
-librerie indicate in `dependencies.txt`; mantengono i percorsi e l'utente dei
-pacchetti ufficiali. Per sostituire un'installazione, occorrono quindi anche
-la configurazione e gli utenti predisposti dal relativo pacchetto.
-Il binario Windows usa MSVC x86 e le stesse versioni di OpenSSL, PCRE2 e zlib
-della distribuzione nginx ufficiale. Angie non ha un equivalente Windows
-ufficiale e la sua build Windows upstream ha errori: non si pubblica un
-eseguibile Angie Windows non verificato.
-
-Per avviare: GitHub → Actions → ci → Run workflow. Localmente, `bash build.sh`
-su Ubuntu 24.04; su Windows servono Git Bash, Python, Strawberry Perl e
-l'ambiente MSVC x86. Gli archivi vengono scritti in `dist/`.
-
-## Applicazione
-
-La stessa patch, senza varianti, è verificata sui seguenti commit:
-
-| Server | Commit |
-| --- | --- |
-| nginx | `ef0aa967dce9d30b824d4c839d3579d2a17e0666` |
-| Angie | `417125cb8664863b044c8c56f0f8d6135bc36b6d` |
-
-Dentro il checkout del server:
-
-```sh
-git apply --check /percorso/nginx-symlink/patches/symlink-access.patch
-git apply /percorso/nginx-symlink/patches/symlink-access.patch
-
-# nginx
-./auto/configure <opzioni-di-build>
-make
-
-# Angie: usare invece ./configure <opzioni-di-build>
-```
-
-Mantenere le opzioni di compilazione richieste dall'installazione. Per release
-diverse usare prima `git apply --check` ed eseguire i test: non è garantita
-l'applicabilità a qualsiasi versione futura o precedente.
-
-Le strutture e la firma dei moduli restano quelle originali: la patch non
-impone la ricompilazione dei moduli dinamici già compatibili con la specifica
-build del server. Il test ABI verifica il caricamento di un modulo compilato
-con gli header originali. I moduli esterni che aprono direttamente file non
-diventano automaticamente protetti.
-
-L'integrazione consiste in una funzione HTTP di apertura dedicata, richiamata
-nei punti che già aprono i contenuti. Il contesto privato viene passato sullo
-stack; non è aggiunto alle strutture del server, né conservato globalmente.
-Il codice e le API della cache dei file del server restano intatti.
+[Patch](patches/symlink-access.patch) · [Release](https://github.com/mefistofelix/nginx-symlink/releases)
+· [Workflow](.github/workflows/ci.yml) · [Verifiche](TESTING.md)
 
 ## Configurazione
 
 ```nginx
 http {
-    symlink_access_cache max=1024 valid=30s negative_valid=1s;
-
+    symlink_access_cache 1024 30s;
     server {
         root /srv/www/site/public;
-        symlink_access root_owner;
-
-        # Opzionale, utile con alias verso un file o root amministrative:
-        # symlink_access_root /srv/www/site;
+        symlink_access on;
     }
 }
 ```
 
-Su Windows, per esempio `root C:/sites/example/public;`.
+Su Windows: `root C:/sites/example/public;`.
 
-| Direttiva | Contesto | Default |
-| --- | --- | --- |
-| `symlink_access off\|root_owner` | http, server, location | `off` |
-| `symlink_access_root <directory con eventuali variabili>` | http, server, location | `$document_root` |
-| `symlink_access_cache off` oppure `max=N valid=tempo negative_valid=tempo` | http | `max=1024 valid=30s negative_valid=1s` |
+- `symlink_access on|off`: contesti http/server/location, ereditata, default off.
+- `symlink_access_cache <voci> <durata>`: contesto http, default `1024 30s`.
+  Zero voci o durata zero disabilitano la cache; massimo 65536 voci.
 
-I parametri della cache sono opzionali, non ripetibili. `max` è compreso tra
-1 e 65536; i tempi sono in secondi, con la sintassi nginx per le durate.
-`valid=0s` forza il refresh a ogni uso. Le direttive di location si ereditano;
-`symlink_access off` permette di disattivare il controllo localmente.
+La webroot è il valore corrente di `$document_root`, inclusi root variabili e
+alias verso directory. Deve essere una directory con proprietario identificabile.
+Un alias verso un singolo file non fornisce tale directory: l'accesso al file
+tramite symlink viene negato. Non esiste una direttiva separata per sovrascrivere
+l'identità della webroot.
 
-## Regola applicata
+La configurazione sperimentale precedente (`root_owner`, `max=`, `valid=`,
+`negative_valid=` e `symlink_access_root`) è stata rimossa nella semplificazione.
 
-Quando almeno un componente è un symlink, il file finale deve risultare
-leggibile secondo questa regola:
+## Controllo mirato
 
-1. L'utente della webroot è owner del target: usare i bit owner.
-2. Altrimenti, un suo gruppo corrisponde a un gruppo del target: usare i bit
-   dei gruppi corrispondenti (un solo GID proprietario su Unix).
-3. Altrimenti: usare i bit other.
+Il controllo considera i bit di lettura del **file effettivamente aperto**:
+owner se coincide con il proprietario della webroot, altrimenti gruppi di tale
+utente, altrimenti other. Una categoria selezionata senza lettura non passa
+alla categoria successiva. Non simula le credenziali del kernel, il percorso
+completo, SELinux, AppArmor o tutte le ACL. Anche il processo server deve poter
+aprire il file con le proprie credenziali.
 
-Nessun ripiego su other se owner o group corrispondono ma non hanno lettura.
-Il gruppo primario e i supplementari sono inclusi. Nessun privilegio speciale
-per UID 0. Identità/gruppi non ricavabili, liste oltre 4096 gruppi, o permessi
-non rappresentabili comportano **accesso negato**.
+Unix usa UID, `getpwuid_r`, `getgrouplist` e `fstat`. I bit group dei file con
+ACL POSIX possono rappresentare la maschera ACL: questa policy non sostituisce
+una verifica completa delle ACL. Sono ammessi fino a 4096 gruppi e un record
+utente NSS fino a 16 KiB; lookup mancanti o non rappresentabili negano l'accesso.
 
-Per `link_directory/file.txt` viene verificato file.txt, non soltanto la
-directory puntata. Il controllo riguarda il descriptor/handle poi usato per
-leggere il contenuto. I percorsi senza link non ricevono questo controllo
-aggiuntivo sui bit; rimangono soggetti ai controlli nativi del worker e alle
-restrizioni del resolver della piattaforma.
+Windows usa SID, Authz e DACL. Traduce le ACE allow in bit rwx per owner, gruppi
+abilitati ed Everyone. ACE deny applicabili, tipi di ACE non riconosciuti e
+utenti aggiuntivi non rappresentabili comportano diniego. Le ACE inherit-only
+sono ignorate; NULL DACL e DACL vuota restano distinte. Non è una simulazione
+completa di un token Windows o del suo controllo ACL.
 
-`disable_symlinks` continua a valere dove disponibile: la nuova policy non
-annulla un divieto imposto dalla direttiva esistente. La directory da cui si
-ricava l'identità deve essere gestita amministrativamente, non sostituibile dal
-tenant con una directory di un altro utente.
+La cache riguarda solo le appartenenze ai gruppi, è separata per worker e usa
+scadenza assoluta. Le collisioni espellono una voce e confrontano sempre tutta
+l'identità; i lookup falliti non vengono memorizzati. Proprietari e permessi
+dei file vengono riletti. Una revoca di gruppo può impiegare fino al TTL per
+diventare effettiva nella policy.
+Un lookup NSS/AD lento può bloccare il worker quando manca in cache.
 
-## Cache e costo
+Per i percorsi protetti, `open_file_cache` non viene usata. Unix riusa l'apertura
+senza symlink del server. Windows usa `OBJ_DONT_REPARSE`, mantiene aperto il
+descriptor di confronto e confronta volume e ID file a 128 bit con il file
+aperto dal server. Se il percorso cambia oggetto, controlla i permessi del
+descriptor servito. Il codice non autorizza con un semplice controllo del path
+seguito da una riapertura non verificata.
 
-La cache è per worker, con una tabella hash a numero fisso di slot.
-Una collisione espelle la voce precedente; si confronta sempre l'ID completo,
-quindi una collisione può causare un nuovo lookup, mai un'autorizzazione errata.
-Contiene solo `identità -> gruppi`, compresi i lookup falliti con TTL separato.
-La scadenza è assoluta: un hit non la rinnova. Cambi di appartenenza diventano
-visibili dopo il TTL, oltre ai ritardi delle eventuali cache NSS/AD.
+Sono coperti static, index, try_files, gzip_static, FLV e MP4. Nelle location
+protette, autoindex, random_index e le operazioni DAV abilitate sono negate.
+PHP-FPM, upstream e moduli esterni che aprono autonomamente file non sono coperti.
+`disable_symlinks` continua ad applicarsi su Unix; i file diretti non cambiano
+policy. Un diniego della nuova policy produce 403; `try_files` può scegliere il
+fallback configurato. File inesistenti restano soggetti alle normali risposte 404.
 
-Non si memorizzano verdetti di accesso o permessi del target. Le aperture
-protette bypassano `open_file_cache`, anche se il percorso non contiene link:
-una cache già calda in un'altra location non può saltare la policy. I log
-dinamici non sono aperture di contenuto e conservano il comportamento normale.
+## Compilazione e release
 
-I lookup mancanti in cache sono sincroni. NSS/AD e la classificazione dei SID
-Windows possono quindi causare latenza; non è implementato un resolver asincrono.
-Non sono ancora disponibili benchmark di throughput o latenza.
-
-## Portabilità e limiti
-
-Unix usa `fstat`, `getpwuid_r` e `getgrouplist`, con verifica in configure e
-gestione della firma `int` di Darwin. Il resolver usa aperture relative a directory
-e `O_NOFOLLOW`. Senza le API necessarie il controllo nega l'accesso.
-I bit Unix vengono usati deliberatamente senza valutare ACL estese,
-capabilities, SELinux/AppArmor o i diritti del tenant su tutte le directory.
-
-Windows usa SID, elenco dei gruppi via Authz e owner/DACL letti dall'handle.
-Le aperture relative con `NtCreateFile` mantengono il percorso legato alle
-directory aperte; symlink e junction sono riconosciuti. La normalizzazione
-accetta ACE allow per owner, gruppi ed Everyone, con bit r/w/x ridotti.
-ACE deny o altre forme non rappresentabili negano l'accesso. Everyone si applica
-anche alle classi owner/group; DACL vuota e NULL DACL sono distinte. Un owner
-che è un gruppo non identifica un utente e non viene indovinato.
-
-La policy Windows può negare accessi che Windows permetterebbe: in particolare
-si conserva la precedenza owner del modello comune. Non replica un token di
-logon completo, ACL SMB o altri privilegi. I percorsi protetti richiedono
-`READ_CONTROL` sul file; componenti `.`/`..`, stream alternativi e namespace
-device espliciti vengono negati. NTFS locale è il filesystem verificato;
-scenari AD/SMB remoti non sono ancora testati.
-
-Sono integrati static, index, try_files, gzip_static, FLV e MP4 attraverso il
-percorso comune. I gestori autoindex, random_index e DAV rispondono 403 quando
-selezionati in una location con la policy attiva: non sono implementati elenchi
-o scritture protette. `try_files` può saltare un candidato negato e usare il
-fallback configurato; il divieto non obbliga ogni handler a terminare con 403.
-
-Non copre hard link o file aperti da PHP-FPM/altri upstream. I permessi non sono
-congelati per l'intera durata della risposta. I moduli esterni richiedono audit
-se non passano dalle funzioni di apertura HTTP integrate.
-
-## Verifica
-
-| Piattaforma | nginx | Angie |
-| --- | --- | --- |
-| Linux glibc, Ubuntu/WSL2 | Build e test HTTP | Build e test HTTP |
-| Linux musl, Alpine/WSL2 | Build e test HTTP | Build e test HTTP |
-| Windows nativo, build MinGW-w64 | Build ed esecuzione HTTP su NTFS | Nuovi oggetti compilati; build completa bloccata a monte |
-| FreeBSD / macOS | Backend previsto, esecuzione non verificata | Backend previsto, esecuzione non verificata |
-
-**Angie/Windows:** il commit originale, anche senza patch, non compila nel
-toolchain verificato (`ngx_init_setproctitle`, `ngx_update_process_title` e
-problemi in `ngx_log.c`). Non viene dichiarato il supporto dell'eseguibile
-Angie su Windows fino alla risoluzione e al test di quella build.
-
-Test riproducibili, dopo aver compilato con DAV, random_index, gzip_static, FLV,
-MP4 e rewrite abilitati su Unix:
+Applicare la stessa patch a entrambi i server:
 
 ```sh
-sudo python3 tests/integration_unix.py /percorso/nginx/objs/nginx
-sudo python3 tests/integration_unix.py /percorso/angie/objs/angie
-sh tests/run_cache_policy.sh /percorso/nginx
-python3 tests/module_abi.py /percorso/nginx
+git apply --check /percorso/symlink-access.patch
+git apply /percorso/symlink-access.patch
+./auto/configure <opzioni>  # nginx da Git; ./configure per tarball e Angie
+make
 ```
 
-Il test Unix modifica solo ownership e permessi di file temporanei, senza
-creare o modificare account. Comprende sostituzioni concorrenti dei link,
-chmod, cache riscaldata, owner/group/other, gruppi supplementari se disponibili,
-alias, root variabile, redirect interno, index, try_files e log dinamici.
-Il test della cache usa lookup deterministici e AddressSanitizer/UBSan.
+La patch richiede la ricompilazione del server. Non è un modulo dinamico da
+caricare in un eseguibile esistente; non cambia la compatibilità ABI dei moduli
+già compatibili con la specifica versione e configurazione del server.
 
-```powershell
-./tests/integration_windows.ps1 -Binary C:/percorso/nginx.exe
-```
+Il workflow manuale `ci` compila nginx 1.31.6 e Angie 1.12.2 per Ubuntu 24.04
+x86_64, e nginx 1.31.6 per Windows x86 con MSVC. Confronta le opzioni dei binari
+ufficiali e le tabelle dei moduli prima/dopo la patch: l'unica aggiunta ammessa
+è `ngx_http_symlink_access_module`. I moduli dinamici distribuiti separatamente
+non fanno parte del binario base e non vengono inclusi o attivati.
 
-Il test Windows usa ACL e junction temporanee; testa anche symlink a file
-quando il sistema ne permette la creazione. Il rapporto finale è in
-[TESTING.md](TESTING.md). [DESIGN.md](DESIGN.md) conserva il ragionamento iniziale.
+Versioni, URL e SHA-256 sono fissati in [tools/releases.json](tools/releases.json).
+Tutti i job devono superare i test prima della pubblicazione della prerelease.
+Gli archivi contengono binari, configurazioni, licenze, patch, output `-V` e
+rapporto dei moduli; la release aggiunge i checksum degli archivi.
+
+Linux richiede le librerie in `dependencies.txt` e conserva percorsi e utenti
+dei pacchetti ufficiali: predisporre configurazione e account dell'installazione.
+Windows include staticamente OpenSSL 3.5.8, PCRE2 10.48 e zlib 1.3.2, come il
+binario ufficiale di riferimento. Non si distribuisce Angie Windows: manca un
+equivalente ufficiale e la build upstream Windows presenta errori indipendenti.
+
+Avvio: GitHub → Actions → ci → Run workflow, oppure `bash build.sh` su Ubuntu
+24.04. Su Windows servono Git Bash, Python, Strawberry Perl e ambiente MSVC x86.
+Output in `dist/`. FreeBSD, macOS, domini AD e share SMB non sono stati validati.

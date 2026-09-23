@@ -1,77 +1,65 @@
-# Verifica della patch
+# Verifica
 
-Patch unica: `patches/symlink-access.patch`.
+## Dimensioni della patch ridotta
 
-- SHA-256: `761794b576bb796b04a31da70fed7f56083cac78fd47df843a3398e523197548`.
-- 44.914 byte; 1.247 righe nel file patch, inclusi contesto e intestazioni.
-- 1.081 righe aggiunte e 9 rimosse: 12 file esistenti modificati e 5 nuovi.
-- Nei file esistenti: 63 righe aggiunte e 9 rimosse.
-- Nei file nuovi: 1.018 righe, di cui 374 nel backend Windows.
-- Documentazione, test e strumenti di verifica sono esterni alla patch.
+- 572 righe aggiunte, 7 rimosse, 13 file coinvolti.
+- Un solo file nuovo: modulo di 516 righe, inclusi Unix, Windows e cache.
+- Nei 12 file esistenti: 56 righe aggiunte e 7 rimosse.
+- 708 righe fisiche nel `.patch`, inclusi intestazioni e contesto.
+- SHA-256: `6262cc297a1dc7c3da4feb2fc2a713b4f4b63cd700fe4d26627110869da1e9e9`.
 
-Nessuna modifica alle strutture esistenti, alla firma ABI, al codice di
-`ngx_open_cached_file`, a `ngx_http_set_disable_symlinks` o ai relativi header
-core. Il confezionamento della patch controlla espressamente questi file.
+La versione precedente aggiungeva 1081 righe in 17 file, con cinque file nuovi.
+La riduzione elimina i backend separati, le strutture intermedie dei permessi,
+il resolver Unix duplicato, le direttive opzionali e la cache negativa.
+Non si tratta di codice spostato fuori dalla patch.
 
-## Applicazione e build
+## Applicazione e ABI
 
-`tools/package_patch.py` ha estratto entrambi i commit originali in directory
-temporanee, applicato esattamente lo stesso file patch e confrontato il risultato
-con i sorgenti effettivamente compilati:
+`tools/package_patch.py` controlla l'assenza di modifiche agli header delle
+strutture core/request, a `ngx_module.h`, a `ngx_open_file_cache` e a
+`ngx_http_set_disable_symlinks`. Applica lo stesso patch ai commit originali:
 
-| Server | Commit | Risultato |
-| --- | --- | --- |
-| nginx | `ef0aa967dce9d30b824d4c839d3579d2a17e0666` | Applicazione esatta, verificata |
-| Angie | `417125cb8664863b044c8c56f0f8d6135bc36b6d` | Applicazione esatta, verificata |
+- nginx: `ef0aa967dce9d30b824d4c839d3579d2a17e0666`.
+- Angie: `417125cb8664863b044c8c56f0f8d6135bc36b6d`.
 
-| Ambiente | nginx | Angie |
-| --- | --- | --- |
-| Ubuntu, GCC 13, glibc, WSL2 | Build riuscita; 291 verifiche HTTP | Build riuscita; 291 verifiche HTTP |
-| Alpine 3.23, musl, WSL2 | Build riuscita; 291 verifiche HTTP | Build riuscita; 291 verifiche HTTP |
-| Windows nativo, NTFS; cross-build MinGW-w64 GCC 13 | Build riuscita; 215 verifiche HTTP native | Oggetti della patch compilati; eseguibile completo non verificabile per errori upstream |
+Il workflow verifica anche l'applicazione ai tarball nginx 1.31.6 e Angie 1.12.2.
+I test ABI compilano un modulo dinamico con il module header originale e con
+quello patchato e ne verificano il caricamento su entrambi i server Linux.
 
-Le 291 verifiche Unix per esecuzione includono 250 richieste durante
-retargeting concorrente del symlink. I casi di gruppi supplementari vengono
-eseguiti quando l'account locale selezionato ne possiede. La verifica delle
-chiusure dei descriptor usa `/proc` negli ambienti Linux utilizzati.
+## Build e confronto dei moduli
 
-La suite Windows ha verificato sia junction di directory sia symlink di file
-sulla macchina corrente, oltre a owner, gruppi, Everyone, DACL vuota, NULL DACL,
-ACE deny, ACE inherit-only e cambi di ACL con open_file_cache già attiva.
-Le ACE deny di scrittura usate nella fixture lasciano il file nativamente
-leggibile: il controllo mirato nega comunque la DACL non rappresentabile.
+Il [workflow CI](https://github.com/mefistofelix/nginx-symlink/actions/workflows/ci.yml)
+parte da sorgenti e binari ufficiali con SHA-256 fissato in `tools/releases.json`.
+Usa `-V` del binario ufficiale, configura il sorgente originale, applica la
+patch e riconfigura. Verifica la tabella dei moduli e le opzioni del binario
+compilato: devono restare uguali, con il solo modulo symlink_access aggiuntivo.
 
-## Cache e ABI
+Riferimenti: pacchetti ufficiali Ubuntu 24.04 x86_64 (111 moduli nginx e 125
+Angie) e zip ufficiale nginx Windows x86. I moduli dinamici separati sono esclusi
+da questo confronto. I rapporti `*-modules.json` accompagnano gli eseguibili.
+Tutti i job devono riuscire prima della pubblicazione.
 
-`tests/run_cache_policy.sh` compila il codice comune effettivo con backend
-deterministico e AddressSanitizer/UndefinedBehaviorSanitizer. Verificati:
+## Test automatici
 
-- Scadenza assoluta dei gruppi, senza rinnovo a ogni hit.
-- Scadenza separata dei lookup negativi.
-- Espulsione per collisione e confronto dell'identità completa.
-- Cache disabilitata e nessun riuso di lookup falliti come lista vuota valida.
-- Precedenza owner/group/other e diniego dei permessi non utilizzabili.
-- Rilascio della memoria della cache.
+- Unix: 291 controlli HTTP per server, inclusi 250 durante sostituzioni concorrenti
+  dei symlink, owner/group/other, gruppi supplementari disponibili, alias, root
+  variabili, redirect, index, try_files, gzip, guardie directory/DAV, metadata
+  modificati, descriptor e log dinamici. Solo le fixture temporanee cambiano owner.
+- Windows: 465 controlli quando la creazione di file symlink è disponibile,
+  incluse junction, DACL, file diretti e 250 richieste durante sostituzioni tra
+  file diretto e symlink verso un target negato. Senza quel privilegio, il test
+  segnala esplicitamente il sottoinsieme eseguito con junction.
+- Cache/policy: include il sorgente effettivo del modulo e sostituisce solo NSS.
+  Verifica TTL assoluto, collisioni, cache off, lookup fallito e precedenza dei
+  permessi con ASan/UBSan. L'instrumentazione ASan delle variabili globali è
+  esclusa per eliminare dal link la configurazione HTTP inutilizzata; heap e
+  stack dei percorsi testati restano instrumentati.
 
-Nessun errore ASan/UBSan nella suite eseguita.
+La prima release `c566eee04a1b` contiene la versione estesa precedente; consultare
+le release successive e i relativi run per la patch ridotta.
 
-`tests/module_abi.py` ha verificato, su entrambi i server Linux, il caricamento
-di un modulo dinamico di prova compilato con il module header originale e con
-quello del checkout patchato. Entrambi sono accettati. Le normali condizioni
-di compatibilità della specifica build nginx/Angie continuano ad applicarsi.
-
-## Limiti verificati
-
-La build Windows di Angie fallisce anche estraendo e compilando il commit
-originale senza patch. Gli errori includono riferimenti non disponibili a
-`ngx_init_setproctitle` e `ngx_update_process_title`, oltre a problemi in
-`ngx_log.c`. La patch non contiene una riscrittura del port Windows di Angie.
-
-FreeBSD e macOS non sono stati eseguiti o compilati in questa sessione.
-Non sono stati testati domini Active Directory, share SMB, tutti i tipi di
-reparse point, tutti i moduli di terze parti o tutte le release dei due server.
-Non sono stati effettuati benchmark di throughput o latenza.
-
-Due directory temporanee di precedenti tentativi della suite Windows sono
-rimaste in `.test-windows`: la pulizia è stata bloccata dal controllo automatico
-degli strumenti. Sono escluse dalla patch e non contengono sorgenti distribuiti.
+Non sono validati FreeBSD/macOS, domini Active Directory, share SMB o tutti i
+filesystem e reparse provider Windows. Non sono stati effettuati benchmark.
+Angie Windows non è distribuito: la build upstream presenta errori indipendenti
+dalla patch. Alcune fixture Windows di tentativi precedenti restano nella
+directory locale ignorata `.test-windows`, esclusa da repository e release.

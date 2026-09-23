@@ -6,6 +6,10 @@ using System;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
 public static class SymlinkAccessTestAcl {
+    static volatile bool racing;
+    static System.Threading.Thread racer;
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    static extern bool MoveFileExW(string from, string to, uint flags);
     [DllImport("advapi32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
     static extern bool ConvertStringSecurityDescriptorToSecurityDescriptorW(string s, uint rev, out IntPtr sd, out uint size);
     [DllImport("advapi32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
@@ -14,6 +18,26 @@ public static class SymlinkAccessTestAcl {
     [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
     [return: MarshalAs(UnmanagedType.U1)]
     public static extern bool CreateSymbolicLinkW(string link, string target, uint flags);
+    public static void StartRace(string path, string denied) {
+        racing = true;
+        racer = new System.Threading.Thread(() => {
+            string temp = path + ".swap";
+            bool link = false;
+            while (racing) {
+                System.IO.File.Delete(temp);
+                if (link) CreateSymbolicLinkW(temp, denied, 2);
+                else System.IO.File.WriteAllText(temp, "RACE-PUBLIC");
+                MoveFileExW(temp, path, 1);
+                link = !link;
+            }
+            System.IO.File.Delete(temp);
+        });
+        racer.Start();
+    }
+    public static void StopRace() {
+        racing = false;
+        if (racer != null) { racer.Join(); racer = null; }
+    }
     public static void Set(string path, string sddl, uint flags = 0x80000004) {
         IntPtr sd; uint size;
         if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, 1, out sd, out size))
@@ -68,6 +92,8 @@ foreach ($kind in @('everyone', 'empty', 'null', 'inherit_only')) {
 $fileLink = Join-Path $web 'file-link'
 $fileLinkAvailable = [SymlinkAccessTestAcl]::CreateSymbolicLinkW($fileLink, (Join-Path $targets 'allow'), 2)
 [IO.File]::WriteAllText((Join-Path $web 'direct'), 'DIRECT')
+Set-TestAcl (Join-Path $web 'direct') 'deny' # direct file: native read allowed, projection would deny
+$racePath = Join-Path $web 'race'
 $junction = Join-Path $web 'link'
 New-Item -ItemType Junction -Path $junction -Target $targets | Out-Null
 $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
@@ -84,13 +110,13 @@ error_log $prefix/error.log info;
 events { worker_connections 64; }
 http {
     access_log off;
-    symlink_access_cache max=2 valid=1s negative_valid=1s;
+    symlink_access_cache 2 1s;
     open_file_cache max=32 inactive=60s;
     open_file_cache_valid 1h;
     server {
         listen 127.0.0.1:$port;
         root $webConf;
-        symlink_access root_owner;
+        symlink_access on;
         location / { }
         location /off/ { alias $webConf/; symlink_access off; }
     }
@@ -146,6 +172,23 @@ try {
         Check-Response '/link/allow' 200 'BODY:allow'
         Check-Response '/link/group' 403
     }
+    if ($fileLinkAvailable) {
+        [IO.File]::WriteAllText($racePath, 'RACE-PUBLIC')
+        [SymlinkAccessTestAcl]::StartRace($racePath, (Join-Path $targets 'deny'))
+        try {
+            for ($i = 0; $i -lt 250; $i++) {
+                $response = $client.GetAsync("http://127.0.0.1:$port/race").GetAwaiter().GetResult()
+                try {
+                    $status = [int]$response.StatusCode
+                    $body = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+                    if ($status -notin @(200, 403) -or ($status -eq 200 -and $body -ne 'RACE-PUBLIC')) {
+                        throw "Concurrent file/link replacement leaked or failed: $status $body"
+                    }
+                    $checks++
+                } finally { $response.Dispose() }
+            }
+        } finally { [SymlinkAccessTestAcl]::StopRace() }
+    }
     Write-Output "PASS $([IO.Path]::GetFileName($binaryPath)): $checks native Windows HTTP checks"
     if (!$fileLinkAvailable) { Write-Output 'File symlink creation unavailable; directory junction path tested.' }
 } catch {
@@ -154,11 +197,13 @@ try {
     }
     throw
 } finally {
+    [SymlinkAccessTestAcl]::StopRace()
     if ($process -and !$process.HasExited) { Stop-Process -Id $process.Id; $process.WaitForExit() }
     $client.Dispose()
     # Remove the junction itself before recursive cleanup; never follow its target.
     if (Test-Path -LiteralPath $junction) { [IO.Directory]::Delete($junction) }
     if ($fileLinkAvailable) { [IO.File]::Delete($fileLink) }
+    [IO.File]::Delete($racePath)
     $resolvedTestRoot = [IO.Path]::GetFullPath($testRoot)
     if (!$resolvedTestRoot.StartsWith($testParent + [IO.Path]::DirectorySeparatorChar)) {
         throw 'Cleanup target escaped test directory'
@@ -166,5 +211,6 @@ try {
     foreach ($fixtureFile in [IO.Directory]::GetFiles($targets)) {
         [SymlinkAccessTestAcl]::Set($fixtureFile, "D:P(A;;FA;;;$($sid.Value))")
     }
+    [SymlinkAccessTestAcl]::Set((Join-Path $web 'direct'), "D:P(A;;FA;;;$($sid.Value))")
     Remove-Item -LiteralPath $resolvedTestRoot -Recurse -Force
 }

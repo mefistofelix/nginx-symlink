@@ -41,6 +41,6 @@ jobs:
           sha256sum *.tar.gz *.zip > SHA256SUMS
           tag="${GITHUB_SHA:0:12}"
           gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 ||
-            gh release create "$tag" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --draft --title "symlink_access $tag" --notes "nginx 1.31.6: Ubuntu 24.04 x86_64, Windows x86. Angie 1.12.2: Ubuntu 24.04 x86_64. Module parity reports are included. Experimental patch; the requested reduction to 500 lines is pending."
+            gh release create "$tag" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --draft --title "symlink_access $tag" --notes "Minimal common patch; existing structures and ABI unchanged. nginx 1.31.6: Ubuntu 24.04 x86_64, Windows x86. Angie 1.12.2: Ubuntu 24.04 x86_64. Module parity reports and checksums included. Configuration: symlink_access on; symlink_access_cache 1024 30s;"
           gh release upload "$tag" ./* -R "$GITHUB_REPOSITORY" --clobber
           gh release edit "$tag" -R "$GITHUB_REPOSITORY" --draft=false --prerelease

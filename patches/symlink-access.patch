@@ -1,40 +1,27 @@
 diff --git a/auto/modules b/auto/modules
-index 3082c8f..0257ea2 100644
+index 3082c8f..0a10ea4 100644
 --- a/auto/modules
 +++ b/auto/modules
-@@ -84,8 +84,10 @@ if [ $HTTP = YES ]; then
+@@ -84,4 +84,5 @@ if [ $HTTP = YES ]; then
          ngx_module_name="ngx_http_module \
                           ngx_http_core_module \
 +                         ngx_http_symlink_access_module \
                           ngx_http_log_module \
                           ngx_http_upstream_module"
-         ngx_module_incs="src/http src/http/modules"
--        ngx_module_deps="src/http/ngx_http.h \
-+        ngx_module_deps="src/core/ngx_symlink_access.h \
-+                         src/http/ngx_http.h \
-                          src/http/ngx_http_request.h \
-                          src/http/ngx_http_config.h \
-@@ -96,6 +98,8 @@ if [ $HTTP = YES ]; then
-                          src/http/ngx_http_upstream.h \
-                          src/http/ngx_http_upstream_round_robin.h"
--        ngx_module_srcs="src/http/ngx_http.c \
-+        ngx_module_srcs="src/core/ngx_symlink_access.c \
-+                         src/http/ngx_http.c \
+@@ -98,4 +99,5 @@ if [ $HTTP = YES ]; then
+         ngx_module_srcs="src/http/ngx_http.c \
                           src/http/ngx_http_core_module.c \
 +                         src/http/modules/ngx_http_symlink_access_module.c \
                           src/http/ngx_http_special_response.c \
                           src/http/ngx_http_request.c \
-@@ -110,4 +114,14 @@ if [ $HTTP = YES ]; then
+@@ -110,4 +112,11 @@ if [ $HTTP = YES ]; then
          ngx_module_link=YES
  
 +        if [ "$NGX_PLATFORM" = win32 ]; then
-+            ngx_module_srcs="$ngx_module_srcs src/os/win32/ngx_symlink_access_win32.c"
 +            case "$NGX_CC_NAME" in
 +                clang | gcc) ngx_module_libs="-lauthz" ;;
 +                *) ngx_module_libs="authz.lib" ;;
 +            esac
-+        else
-+            ngx_module_srcs="$ngx_module_srcs src/os/unix/ngx_symlink_access_unix.c"
 +        fi
 +
          . auto/module
@@ -68,226 +55,6 @@ index 4e85090..3844977 100644
 +
  ngx_feature="getaddrinfo()"
  ngx_feature_name="NGX_HAVE_GETADDRINFO"
-diff --git a/src/core/ngx_symlink_access.c b/src/core/ngx_symlink_access.c
-new file mode 100644
-index 0000000..cc232a6
---- /dev/null
-+++ b/src/core/ngx_symlink_access.c
-@@ -0,0 +1,158 @@
-+/* Symlink target access policy. SPDX-License-Identifier: BSD-2-Clause */
-+#include <ngx_config.h>
-+#include <ngx_core.h>
-+#include <ngx_symlink_access.h>
-+
-+typedef struct {
-+    ngx_pool_t        *pool;
-+    ngx_sa_id_t        user;
-+    ngx_sa_id_t       *groups;
-+    ngx_uint_t         n;
-+    ngx_int_t          status;
-+    time_t             created;
-+} ngx_sa_entry_t;
-+
-+struct ngx_sa_cache_s {
-+    ngx_sa_entry_t   **slots;
-+    ngx_uint_t         max;
-+    time_t             valid;
-+    time_t             negative_valid;
-+};
-+
-+ngx_int_t
-+ngx_sa_id_copy(ngx_pool_t *pool, ngx_sa_id_t *id, const void *data, size_t len)
-+{
-+    id->data = ngx_palloc(pool, len);
-+    if (id->data == NULL) {
-+        return NGX_ERROR;
-+    }
-+    ngx_memcpy(id->data, data, len);
-+    id->len = len;
-+    return NGX_OK;
-+}
-+
-+ngx_int_t
-+ngx_sa_id_equal(const ngx_sa_id_t *a, const ngx_sa_id_t *b)
-+{
-+    return a->len == b->len && a->len != 0
-+           && ngx_memcmp(a->data, b->data, a->len) == 0;
-+}
-+
-+static void
-+ngx_sa_cleanup(void *data)
-+{
-+    ngx_sa_cache_t *cache = data;
-+    ngx_uint_t i;
-+    for (i = 0; i < cache->max; i++) {
-+        if (cache->slots[i]) { ngx_destroy_pool(cache->slots[i]->pool); }
-+    }
-+}
-+
-+ngx_sa_cache_t *
-+ngx_sa_cache_create(ngx_pool_t *pool, ngx_uint_t max, time_t valid,
-+    time_t negative_valid)
-+{
-+    ngx_sa_cache_t     *cache;
-+    ngx_pool_cleanup_t *cln;
-+    cache = ngx_pcalloc(pool, sizeof(ngx_sa_cache_t));
-+    cln = ngx_pool_cleanup_add(pool, 0);
-+    if (cache == NULL || cln == NULL) { return NULL; }
-+    cache->slots = ngx_pcalloc(pool, (max ? max : 1) * sizeof(ngx_sa_entry_t *));
-+    if (cache->slots == NULL) { return NULL; }
-+    cache->max = max;
-+    cache->valid = valid;
-+    cache->negative_valid = negative_valid;
-+    cln->handler = ngx_sa_cleanup;
-+    cln->data = cache;
-+    return cache;
-+}
-+
-+static ngx_int_t
-+ngx_sa_groups(ngx_symlink_access_t *ctx, ngx_sa_id_t *user,
-+    ngx_sa_id_t **groups, ngx_uint_t *n)
-+{
-+    ngx_sa_cache_t    *cache;
-+    ngx_sa_entry_t    *entry;
-+    ngx_pool_t       *pool;
-+    ngx_uint_t        slot;
-+    time_t            now, ttl;
-+
-+    cache = ctx->cache;
-+    if (cache == NULL || cache->max == 0) {
-+        return ngx_sa_get_user_groups(ctx->pool, user, groups, n);
-+    }
-+    now = ngx_time();
-+    slot = ngx_crc32_short(user->data, user->len) % cache->max;
-+    entry = cache->slots[slot];
-+    if (entry && ngx_sa_id_equal(user, &entry->user)) {
-+        ttl = entry->status == NGX_OK ? cache->valid : cache->negative_valid;
-+        if (now >= entry->created && now - entry->created < ttl) {
-+            *groups = entry->groups;
-+            *n = entry->n;
-+            return entry->status;
-+        }
-+    }
-+    /* A collision evicts, never authorizes: always compare the complete ID. */
-+    if (entry) { ngx_destroy_pool(entry->pool); cache->slots[slot] = NULL; }
-+    pool = ngx_create_pool(4096, ctx->pool->log);
-+    if (pool == NULL) { return NGX_ERROR; }
-+    entry = ngx_pcalloc(pool, sizeof(ngx_sa_entry_t));
-+    if (entry == NULL || ngx_sa_id_copy(pool, &entry->user, user->data,
-+                                      user->len) != NGX_OK)
-+    {
-+        ngx_destroy_pool(pool);
-+        return NGX_ERROR;
-+    }
-+    entry->pool = pool;
-+    entry->status = ngx_sa_get_user_groups(pool, user, &entry->groups, &entry->n);
-+    /* Timestamp before lookup: a slow lookup must not extend stale membership. */
-+    entry->created = now;
-+    cache->slots[slot] = entry;
-+    *groups = entry->groups;
-+    *n = entry->n;
-+    return entry->status;
-+}
-+
-+ngx_int_t
-+ngx_sa_check(ngx_symlink_access_t *ctx, ngx_fd_t fd)
-+{
-+    ngx_fd_t        root;
-+    ngx_sa_access_t base, target;
-+    ngx_sa_id_t    *groups;
-+    ngx_uint_t      n, i, j, bits;
-+    ngx_flag_t      matched;
-+
-+    ngx_memzero(&base, sizeof(base));
-+    ngx_memzero(&target, sizeof(target));
-+    root = ngx_sa_open_root(&ctx->root);
-+    if (root == NGX_INVALID_FILE) { return NGX_DECLINED; }
-+    /* The root owner is sufficient even when its ACL projection is unusable. */
-+    (void) ngx_sa_get_path_access(ctx->pool, root, &base);
-+    ngx_close_file(root);
-+    if (base.owner.len == 0
-+        || ngx_sa_get_path_access(ctx->pool, fd, &target) != NGX_OK
-+        || !target.usable)
-+    {
-+        return NGX_DECLINED;
-+    }
-+    if (ngx_sa_groups(ctx, &base.owner, &groups, &n) != NGX_OK) {
-+        return NGX_DECLINED;
-+    }
-+    if (ngx_sa_id_equal(&base.owner, &target.owner)) {
-+        bits = target.owner_bits;
-+    } else {
-+        bits = 0;
-+        matched = 0;
-+        for (i = 0; i < target.n; i++) {
-+            for (j = 0; j < n; j++) {
-+                if (ngx_sa_id_equal(&target.groups[i].id, &groups[j])) {
-+                    matched = 1;
-+                    bits |= target.groups[i].bits;
-+                    break;
-+                }
-+            }
-+        }
-+        if (!matched) { bits = target.other_bits; }
-+    }
-+    return (bits & NGX_SA_READ) ? NGX_OK : NGX_DECLINED;
-+}
-diff --git a/src/core/ngx_symlink_access.h b/src/core/ngx_symlink_access.h
-new file mode 100644
-index 0000000..17357cc
---- /dev/null
-+++ b/src/core/ngx_symlink_access.h
-@@ -0,0 +1,50 @@
-+/* Symlink target access policy. SPDX-License-Identifier: BSD-2-Clause */
-+#ifndef _NGX_SYMLINK_ACCESS_H_INCLUDED_
-+#define _NGX_SYMLINK_ACCESS_H_INCLUDED_
-+
-+#define NGX_SA_READ        4
-+#define NGX_SA_WRITE       2
-+#define NGX_SA_EXECUTE     1
-+#define NGX_SA_MAX_GROUPS  4096
-+
-+typedef ngx_str_t ngx_sa_id_t;
-+
-+typedef struct {
-+    ngx_sa_id_t  id;
-+    ngx_uint_t   bits;
-+} ngx_sa_group_access_t;
-+
-+typedef struct {
-+    ngx_sa_id_t             owner;
-+    ngx_uint_t              owner_bits;
-+    ngx_uint_t              other_bits;
-+    ngx_uint_t              n;
-+    ngx_sa_group_access_t  *groups;
-+    ngx_flag_t              usable;
-+} ngx_sa_access_t;
-+
-+typedef struct ngx_sa_cache_s ngx_sa_cache_t;
-+typedef struct ngx_symlink_access_s ngx_symlink_access_t;
-+
-+struct ngx_symlink_access_s {
-+    ngx_str_t        root;
-+    ngx_pool_t      *pool;
-+    ngx_sa_cache_t  *cache;
-+};
-+
-+ngx_sa_cache_t *ngx_sa_cache_create(ngx_pool_t *pool, ngx_uint_t max,
-+    time_t valid, time_t negative_valid);
-+ngx_int_t ngx_sa_id_copy(ngx_pool_t *pool, ngx_sa_id_t *id,
-+    const void *data, size_t len);
-+ngx_int_t ngx_sa_id_equal(const ngx_sa_id_t *a, const ngx_sa_id_t *b);
-+ngx_int_t ngx_sa_get_user_groups(ngx_pool_t *pool, ngx_sa_id_t *user,
-+    ngx_sa_id_t **groups, ngx_uint_t *n);
-+ngx_int_t ngx_sa_get_path_access(ngx_pool_t *pool, ngx_fd_t fd,
-+    ngx_sa_access_t *access);
-+ngx_fd_t ngx_sa_open_root(ngx_str_t *root);
-+ngx_int_t ngx_sa_check(ngx_symlink_access_t *ctx, ngx_fd_t fd);
-+ngx_fd_t ngx_symlink_access_open(ngx_str_t *name, ngx_open_file_info_t *of,
-+    ngx_symlink_access_t *ctx, ngx_int_t mode, ngx_int_t create,
-+    ngx_int_t access, ngx_log_t *log);
-+
-+#endif
 diff --git a/src/http/modules/ngx_http_autoindex_module.c b/src/http/modules/ngx_http_autoindex_module.c
 index 8f594d1..07045b3 100644
 --- a/src/http/modules/ngx_http_autoindex_module.c
@@ -394,258 +161,525 @@ index 8b0bb14..fba02c5 100644
      {
 diff --git a/src/http/modules/ngx_http_symlink_access_module.c b/src/http/modules/ngx_http_symlink_access_module.c
 new file mode 100644
-index 0000000..5c5200c
+index 0000000..6c6c4cf
 --- /dev/null
 +++ b/src/http/modules/ngx_http_symlink_access_module.c
-@@ -0,0 +1,249 @@
-+/* Symlink target access policy. SPDX-License-Identifier: BSD-2-Clause */
+@@ -0,0 +1,516 @@
++/* Targeted symlink access checks. SPDX-License-Identifier: BSD-2-Clause */
 +#include <ngx_config.h>
 +#include <ngx_core.h>
 +#include <ngx_http.h>
-+#include <ngx_symlink_access.h>
++
++#if (NGX_WIN32)
++#include <aclapi.h>
++#include <authz.h>
++#include <winternl.h>
++#include <winioctl.h>
++typedef struct { u_char data[SECURITY_MAX_SID_SIZE]; } ngx_sa_id_t;
++typedef TOKEN_GROUPS ngx_sa_groups_t;
++#define NGX_SA_ROOT_MODE (READ_CONTROL|FILE_READ_ATTRIBUTES)
++#else
++#include <pwd.h>
++#include <grp.h>
++typedef uid_t ngx_sa_id_t;
++#if defined(__APPLE__)
++typedef int ngx_sa_gid_t;
++#else
++typedef gid_t ngx_sa_gid_t;
++#endif
++typedef struct {
++    int n;
++    ngx_sa_gid_t ids[];
++} ngx_sa_groups_t;
++#define NGX_SA_ROOT_MODE (NGX_FILE_SEARCH|NGX_FILE_NONBLOCK)
++#endif
 +
 +typedef struct {
-+    ngx_uint_t       max;
-+    time_t           valid;
-+    time_t           negative_valid;
-+    ngx_flag_t       configured;
-+    ngx_sa_cache_t  *cache;
-+} ngx_http_sa_main_conf_t;
++    ngx_sa_id_t owner;
++    ngx_sa_groups_t *groups;
++} ngx_sa_user_t;
 +
 +typedef struct {
-+    ngx_uint_t                 enabled;
-+    ngx_http_complex_value_t  *root;
-+} ngx_http_sa_loc_conf_t;
++    ngx_pool_t *pool;
++    time_t created;
++    ngx_sa_user_t user;
++} ngx_sa_entry_t;
 +
-+static void *ngx_http_sa_create_main(ngx_conf_t *cf);
-+static char *ngx_http_sa_init_main(ngx_conf_t *cf, void *conf);
-+static void *ngx_http_sa_create_loc(ngx_conf_t *cf);
-+static char *ngx_http_sa_merge_loc(ngx_conf_t *cf, void *parent, void *child);
-+static char *ngx_http_sa_cache(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
++typedef struct {
++    ngx_uint_t max;
++    time_t valid;
++    ngx_sa_entry_t **slots;
++} ngx_sa_cache_t;
 +
-+static ngx_conf_enum_t ngx_http_sa_modes[] = {
-+    { ngx_string("off"), 0 },
-+    { ngx_string("root_owner"), 1 },
-+    { ngx_null_string, 0 }
-+};
++#if (NGX_WIN32)
++static ngx_int_t
++ngx_sa_sid_type(ngx_pool_t *pool, PSID sid, SID_NAME_USE *type)
++{
++    WCHAR *name, *domain;
++    DWORD n = 0, d = 0;
++    LookupAccountSidW(NULL, sid, NULL, &n, NULL, &d, type);
++    if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || n > 32768 || d > 32768) {
++        return NGX_DECLINED;
++    }
++    name = ngx_palloc(pool, (n + 1) * sizeof(WCHAR));
++    domain = ngx_palloc(pool, (d + 1) * sizeof(WCHAR));
++    return name && domain && LookupAccountSidW(NULL, sid, name, &n, domain, &d, type)
++           ? NGX_OK : NGX_DECLINED;
++}
 +
-+static ngx_command_t ngx_http_sa_commands[] = {
++static ngx_int_t
++ngx_sa_owner(ngx_fd_t fd, ngx_sa_id_t *id)
++{
++    PSECURITY_DESCRIPTOR sd = NULL;
++    PSID owner;
++    ngx_int_t rc = NGX_DECLINED;
++    if (GetSecurityInfo(fd, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION,
++                        &owner, NULL, NULL, NULL, &sd) != ERROR_SUCCESS) {
++        return rc;
++    }
++    ngx_memzero(id, sizeof(*id));
++    if (owner && IsValidSid(owner) && CopySid(sizeof(id->data), id->data, owner)) {
++        rc = NGX_OK;
++    }
++    LocalFree(sd);
++    return rc;
++}
++
++static ngx_int_t
++ngx_sa_user_groups(ngx_pool_t *pool, ngx_sa_user_t *user)
++{
++    AUTHZ_RESOURCE_MANAGER_HANDLE rm = NULL;
++    AUTHZ_CLIENT_CONTEXT_HANDLE ctx = NULL;
++    SID_NAME_USE type;
++    LUID luid = { 0, 0 };
++    DWORD size = 0;
++    ngx_int_t rc = NGX_DECLINED;
++    if (ngx_sa_sid_type(pool, user->owner.data, &type) != NGX_OK || type != SidTypeUser
++        || !AuthzInitializeResourceManager(AUTHZ_RM_FLAG_NO_AUDIT, NULL, NULL,
++                                           NULL, L"symlink_access", &rm)) {
++        return rc;
++    }
++    if (!AuthzInitializeContextFromSid(0, user->owner.data, rm, NULL, luid, NULL, &ctx)) {
++        goto done;
++    }
++    AuthzGetInformationFromContext(ctx, AuthzContextInfoGroupsSids, 0, &size, NULL);
++    if (GetLastError() != ERROR_INSUFFICIENT_BUFFER
++        || size < sizeof(TOKEN_GROUPS) || size > 1024 * 1024) { goto done; }
++    user->groups = ngx_palloc(pool, size);
++    if (user->groups && AuthzGetInformationFromContext(ctx, AuthzContextInfoGroupsSids,
++                                                      size, &size, user->groups)
++        && user->groups->GroupCount <= 4096) {
++        rc = NGX_OK;
++    }
++done:
++    if (ctx) { AuthzFreeContext(ctx); }
++    AuthzFreeResourceManager(rm);
++    return rc;
++}
++
++/* Return normalized rwx bits with owner/group/other precedence; -1 denies. */
++static ngx_int_t
++ngx_sa_permissions(ngx_pool_t *pool, ngx_fd_t fd, ngx_sa_user_t *user)
++{
++    PSECURITY_DESCRIPTOR sd = NULL;
++    PSID owner, sid;
++    PACL acl;
++    ACE_HEADER *header;
++    ACCESS_ALLOWED_ACE *ace;
++    SID_NAME_USE type;
++    GENERIC_MAPPING map = { FILE_GENERIC_READ, FILE_GENERIC_WRITE,
++                            FILE_GENERIC_EXECUTE, FILE_ALL_ACCESS };
++    DWORD i, j, mask, attr;
++    ngx_int_t bits, own = 0, group = 0, other = 0, result = NGX_ERROR;
++    ngx_flag_t matched = 0;
++    if (GetSecurityInfo(fd, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION|DACL_SECURITY_INFORMATION,
++                        &owner, NULL, &acl, NULL, &sd) != ERROR_SUCCESS) { return result; }
++    if (!owner || !IsValidSid(owner)) { goto done; }
++    if (acl == NULL) { result = 7; goto done; }
++    if (!IsValidAcl(acl) || acl->AceCount > 4096) { goto done; }
++    for (i = 0; i < acl->AceCount; i++) {
++        if (!GetAce(acl, i, (void **) &header)) { goto done; }
++        if (header->AceFlags & INHERIT_ONLY_ACE) { continue; }
++        if (header->AceType != ACCESS_ALLOWED_ACE_TYPE) { goto done; }
++        ace = (ACCESS_ALLOWED_ACE *) header;
++        sid = (PSID) &ace->SidStart;
++        if (!IsValidSid(sid)) { goto done; }
++        mask = ace->Mask;
++        MapGenericMask(&mask, &map);
++        bits = ((mask & FILE_READ_DATA) ? 4 : 0) | ((mask & FILE_WRITE_DATA) ? 2 : 0)
++               | ((mask & FILE_EXECUTE) ? 1 : 0);
++        if (EqualSid(sid, owner)) { own |= bits; }
++        else if (IsWellKnownSid(sid, WinWorldSid)) { other |= bits; }
++        else {
++            if (ngx_sa_sid_type(pool, sid, &type) != NGX_OK
++                || (type != SidTypeGroup && type != SidTypeAlias && type != SidTypeWellKnownGroup)) {
++                goto done;
++            }
++            for (j = 0; j < user->groups->GroupCount; j++) {
++                attr = user->groups->Groups[j].Attributes;
++                if ((attr & SE_GROUP_ENABLED) && !(attr & SE_GROUP_USE_FOR_DENY_ONLY)
++                    && EqualSid(sid, user->groups->Groups[j].Sid)) {
++                    matched = 1;
++                    group |= bits;
++                }
++            }
++        }
++    }
++    result = other | (EqualSid(owner, user->owner.data) ? own : matched ? group : 0);
++done:
++    LocalFree(sd);
++    return result;
++}
++
++/* OBJ_DONT_REPARSE rejects reparses anywhere below the volume/share handle. */
++static ngx_fd_t
++ngx_sa_nofollow(ngx_str_t *name, ngx_pool_t *pool, ngx_flag_t *linked)
++{
++    typedef NTSTATUS (NTAPI *open_pt)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES,
++        PIO_STATUS_BLOCK, PLARGE_INTEGER, ULONG, ULONG, ULONG, ULONG, PVOID, ULONG);
++    typedef ULONG (WINAPI *error_pt)(NTSTATUS);
++    open_pt openfn;
++    error_pt errfn;
++    FARPROC proc;
++    HANDLE root, fd = INVALID_HANDLE_VALUE;
++    WCHAR *path, *p, saved;
++    UNICODE_STRING part;
++    OBJECT_ATTRIBUTES oa;
++    IO_STATUS_BLOCK io;
++    NTSTATUS status;
++    int n;
++    DWORD error = ERROR_ACCESS_DENIED;
++    if (!name->len || name->len > 32760) { goto failed; }
++    path = ngx_palloc(pool, (name->len + 1) * sizeof(WCHAR));
++    if (path == NULL) { goto failed; }
++    n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, (char *) name->data,
++                           (int) name->len, path, (int) name->len);
++    if (!n) { goto failed; }
++    path[n] = 0;
++    for (p = path; *p; p++) { if (*p == L'/') { *p = L'\\'; } }
++    if (n >= 3 && path[1] == L':' && path[2] == L'\\') { p = path + 3; }
++    else if (n > 5 && path[0] == L'\\' && path[1] == L'\\'
++             && path[2] != L'?' && path[2] != L'.') {
++        p = wcschr(path + 2, L'\\');
++        if (p == NULL || p == path + 2) { goto failed; }
++        p = wcschr(p + 1, L'\\');
++        if (p == NULL) { goto failed; }
++        p++;
++    } else { goto failed; }
++    saved = *p;
++    *p = 0;
++    root = CreateFileW(path, FILE_READ_ATTRIBUTES|FILE_TRAVERSE,
++                       FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
++                       NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
++    *p = saved;
++    if (root == INVALID_HANDLE_VALUE) { return root; }
++    if (!*p) { return root; }
++    proc = GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtCreateFile");
++    ngx_memcpy(&openfn, &proc, sizeof(openfn));
++    proc = GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlNtStatusToDosError");
++    ngx_memcpy(&errfn, &proc, sizeof(errfn));
++    if (openfn && errfn) {
++        part.Buffer = p;
++        part.Length = part.MaximumLength = (USHORT) (wcslen(p) * sizeof(WCHAR));
++        ngx_memzero(&oa, sizeof(oa));
++        oa.Length = sizeof(oa);
++        oa.RootDirectory = root;
++        oa.ObjectName = &part;
++        oa.Attributes = 0x1040; /* OBJ_DONT_REPARSE | OBJ_CASE_INSENSITIVE */
++        status = openfn(&fd, GENERIC_READ|SYNCHRONIZE, &oa, &io, NULL, 0,
++                        FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
++                        1 /* FILE_OPEN */, 0x20 /* synchronous */, NULL, 0);
++        if (status < 0) {
++            *linked = (ULONG) status == 0xc000050b; /* STATUS_REPARSE_POINT_ENCOUNTERED */
++            error = errfn(status);
++            fd = INVALID_HANDLE_VALUE;
++        }
++    }
++    CloseHandle(root);
++    if (fd != INVALID_HANDLE_VALUE) { return fd; }
++failed:
++    SetLastError(error);
++    return INVALID_HANDLE_VALUE;
++}
++
++static ngx_int_t
++ngx_sa_open(ngx_str_t *name, ngx_open_file_info_t *of, ngx_pool_t *pool, ngx_flag_t *linked)
++{
++    /* FileIdInfo: 64-bit volume ID + 128-bit file ID, including ReFS. */
++    typedef struct { ULONGLONG volume; BYTE id[16]; } file_id_t;
++    typedef BOOL (WINAPI *info_pt)(HANDLE, int, void *, DWORD);
++    file_id_t first, second;
++    info_pt info;
++    FARPROC proc;
++    ngx_fd_t probe;
++    ngx_int_t rc;
++    probe = ngx_sa_nofollow(name, pool, linked);
++    if (probe == INVALID_HANDLE_VALUE && !*linked) {
++        of->err = ngx_errno;
++        of->failed = "symlink_access";
++        return NGX_ERROR;
++    }
++    /* Retain nginx's path validation, metadata, directio and descriptor cleanup. */
++    rc = ngx_open_cached_file(NULL, name, of, pool);
++    if (rc == NGX_OK && !of->is_dir && probe != INVALID_HANDLE_VALUE) {
++        proc = GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetFileInformationByHandleEx");
++        ngx_memcpy(&info, &proc, sizeof(info));
++        *linked = !info || !info(probe, 18 /* FileIdInfo */, &first, sizeof(first))
++                  || !info(of->fd, 18, &second, sizeof(second))
++                  || ngx_memcmp(&first, &second, sizeof(first)) != 0;
++    }
++    if (probe != INVALID_HANDLE_VALUE) { CloseHandle(probe); }
++    if (rc != NGX_OK && *linked && of->err != NGX_ENOENT && of->err != NGX_ENOPATH) {
++        of->err = NGX_EACCES;
++    }
++    return rc;
++}
++
++#else
++static ngx_int_t
++ngx_sa_owner(ngx_fd_t fd, ngx_sa_id_t *id)
++{
++    struct stat st;
++    if (fstat(fd, &st) == -1) { return NGX_DECLINED; }
++    *id = st.st_uid;
++    return NGX_OK;
++}
++
++static ngx_int_t
++ngx_sa_user_groups(ngx_pool_t *pool, ngx_sa_user_t *user)
++{
++#if (NGX_HAVE_GETGROUPLIST)
++    struct passwd pw, *found;
++    char buf[16384];
++    ngx_sa_gid_t ids[4096];
++    int n = 4096;
++    if (getpwuid_r(user->owner, &pw, buf, sizeof(buf), &found) != 0 || found == NULL
++        || getgrouplist(pw.pw_name, pw.pw_gid, ids, &n) == -1 || n < 1 || n > 4096) {
++        return NGX_DECLINED;
++    }
++    user->groups = ngx_palloc(pool, offsetof(ngx_sa_groups_t, ids) + n * sizeof(ids[0]));
++    if (user->groups == NULL) { return NGX_DECLINED; }
++    user->groups->n = n;
++    ngx_memcpy(user->groups->ids, ids, n * sizeof(ids[0]));
++    return NGX_OK;
++#else
++    return NGX_DECLINED;
++#endif
++}
++
++static ngx_int_t
++ngx_sa_permissions(ngx_pool_t *pool, ngx_fd_t fd, ngx_sa_user_t *user)
++{
++    struct stat st;
++    int i;
++    if (fstat(fd, &st) == -1 || !S_ISREG(st.st_mode)) { return NGX_ERROR; }
++    if (st.st_uid == user->owner) { return (st.st_mode >> 6) & 7; }
++    for (i = 0; i < user->groups->n; i++) {
++        if (st.st_gid == (gid_t) user->groups->ids[i]) { return (st.st_mode >> 3) & 7; }
++    }
++    return st.st_mode & 7;
++}
++
++static ngx_int_t
++ngx_sa_open(ngx_str_t *name, ngx_open_file_info_t *of, ngx_pool_t *pool, ngx_flag_t *linked)
++{
++#if (NGX_HAVE_OPENAT)
++    ngx_open_file_info_t probe = *of;
++    ngx_int_t rc;
++    /* Successful no-follow open pins the served file; no path-only precheck. */
++    probe.disable_symlinks = NGX_DISABLE_SYMLINKS_ON;
++    probe.disable_symlinks_from = 0;
++    rc = ngx_open_cached_file(NULL, name, &probe, pool);
++    if (rc == NGX_OK) { *of = probe; return NGX_OK; }
++    if (probe.err != NGX_ELOOP && probe.err != NGX_ENOTDIR) { *of = probe; return rc; }
++    *linked = 1;
++    /* Honor the existing disable_symlinks policy on the followed open too. */
++    return ngx_open_cached_file(NULL, name, of, pool);
++#else
++    of->err = NGX_EACCES;
++    of->failed = "symlink_access";
++    return NGX_ERROR;
++#endif
++}
++#endif
++
++static void
++ngx_sa_cleanup(void *data)
++{
++    ngx_sa_cache_t *cache = data;
++    ngx_uint_t i;
++    for (i = 0; i < cache->max; i++) {
++        if (cache->slots[i]) { ngx_destroy_pool(cache->slots[i]->pool); }
++    }
++}
++
++static ngx_sa_user_t *
++ngx_sa_cached_user(ngx_sa_cache_t *cache, ngx_pool_t *request_pool, ngx_sa_id_t *owner)
++{
++    ngx_sa_entry_t *entry;
++    ngx_pool_t *pool = request_pool;
++    ngx_uint_t slot = 0;
++    time_t now = ngx_time();
++    ngx_flag_t enabled = cache->max && cache->valid;
++    if (enabled) {
++        slot = ngx_crc32_short((u_char *) owner, sizeof(*owner)) % cache->max;
++        entry = cache->slots[slot];
++        if (entry && ngx_memcmp(owner, &entry->user.owner, sizeof(*owner)) == 0
++            && now >= entry->created && now - entry->created < cache->valid) {
++            return &entry->user;
++        }
++        if (entry) { ngx_destroy_pool(entry->pool); cache->slots[slot] = NULL; }
++        pool = ngx_create_pool(4096, request_pool->log);
++        if (pool == NULL) { return NULL; }
++    }
++    entry = ngx_pcalloc(pool, sizeof(*entry));
++    if (entry) {
++        entry->pool = pool;
++        entry->created = now; /* Absolute expiry, measured before the slow lookup. */
++        entry->user.owner = *owner;
++        if (ngx_sa_user_groups(pool, &entry->user) == NGX_OK) {
++            if (enabled) { cache->slots[slot] = entry; }
++            return &entry->user;
++        }
++    }
++    if (enabled) { ngx_destroy_pool(pool); }
++    return NULL; /* Unknown identities and failed lookups never authorize. */
++}
++
++static void *
++ngx_sa_create_main(ngx_conf_t *cf)
++{
++    ngx_sa_cache_t *cache = ngx_pcalloc(cf->pool, sizeof(*cache));
++    if (cache) { cache->max = 1024; cache->valid = NGX_CONF_UNSET; }
++    return cache;
++}
++
++static char *
++ngx_sa_init_main(ngx_conf_t *cf, void *data)
++{
++    ngx_sa_cache_t *cache = data;
++    ngx_pool_cleanup_t *cln;
++    ngx_conf_init_value(cache->valid, 30);
++    if (!cache->max || !cache->valid) { cache->max = 0; return NGX_CONF_OK; }
++    cache->slots = ngx_pcalloc(cf->pool, cache->max * sizeof(ngx_sa_entry_t *));
++    cln = ngx_pool_cleanup_add(cf->pool, 0);
++    if (cache->slots == NULL || cln == NULL) { return NGX_CONF_ERROR; }
++    cln->handler = ngx_sa_cleanup;
++    cln->data = cache;
++    return NGX_CONF_OK;
++}
++
++static char *
++ngx_sa_cache_conf(ngx_conf_t *cf, ngx_command_t *cmd, void *data)
++{
++    ngx_sa_cache_t *cache = data;
++    ngx_str_t *v = cf->args->elts;
++    ngx_int_t n = ngx_atoi(v[1].data, v[1].len);
++    if (cache->valid != NGX_CONF_UNSET) { return "is duplicate"; }
++    cache->valid = ngx_parse_time(&v[2], 1);
++    if (n < 0 || n > 65536 || cache->valid == (time_t) NGX_ERROR) {
++        return "requires 0..65536 entries and a valid duration";
++    }
++    cache->max = n;
++    return NGX_CONF_OK;
++}
++
++static void *
++ngx_sa_create_loc(ngx_conf_t *cf)
++{
++    ngx_flag_t *enabled = ngx_palloc(cf->pool, sizeof(*enabled));
++    if (enabled) { *enabled = NGX_CONF_UNSET; }
++    return enabled;
++}
++
++static char *
++ngx_sa_merge_loc(ngx_conf_t *cf, void *parent, void *child)
++{
++    ngx_flag_t *prev = parent, *enabled = child;
++    ngx_conf_merge_value(*enabled, *prev, 0);
++    return NGX_CONF_OK;
++}
++
++static ngx_command_t ngx_sa_commands[] = {
 +    { ngx_string("symlink_access"),
-+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
-+      ngx_conf_set_enum_slot, NGX_HTTP_LOC_CONF_OFFSET,
-+      offsetof(ngx_http_sa_loc_conf_t, enabled), ngx_http_sa_modes },
-+    { ngx_string("symlink_access_root"),
-+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
-+      ngx_http_set_complex_value_slot, NGX_HTTP_LOC_CONF_OFFSET,
-+      offsetof(ngx_http_sa_loc_conf_t, root), NULL },
-+    { ngx_string("symlink_access_cache"), NGX_HTTP_MAIN_CONF|NGX_CONF_1MORE,
-+      ngx_http_sa_cache, NGX_HTTP_MAIN_CONF_OFFSET, 0, NULL },
++      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
++      ngx_conf_set_flag_slot, NGX_HTTP_LOC_CONF_OFFSET, 0, NULL },
++    { ngx_string("symlink_access_cache"), NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE2,
++      ngx_sa_cache_conf, NGX_HTTP_MAIN_CONF_OFFSET, 0, NULL },
 +    ngx_null_command
 +};
 +
-+static ngx_http_module_t ngx_http_sa_ctx = {
-+    NULL, NULL,
-+    ngx_http_sa_create_main, ngx_http_sa_init_main,
-+    NULL, NULL,
-+    ngx_http_sa_create_loc, ngx_http_sa_merge_loc
++static ngx_http_module_t ngx_sa_module_ctx = {
++    NULL, NULL, ngx_sa_create_main, ngx_sa_init_main,
++    NULL, NULL, ngx_sa_create_loc, ngx_sa_merge_loc
 +};
 +
 +ngx_module_t ngx_http_symlink_access_module = {
-+    NGX_MODULE_V1, &ngx_http_sa_ctx, ngx_http_sa_commands, NGX_HTTP_MODULE,
++    NGX_MODULE_V1, &ngx_sa_module_ctx, ngx_sa_commands, NGX_HTTP_MODULE,
 +    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NGX_MODULE_V1_PADDING
 +};
-+
-+static void *
-+ngx_http_sa_create_main(ngx_conf_t *cf)
-+{
-+    ngx_http_sa_main_conf_t *conf;
-+    conf = ngx_pcalloc(cf->pool, sizeof(*conf));
-+    if (conf == NULL) { return NULL; }
-+    conf->max = 1024;
-+    conf->valid = 30;
-+    conf->negative_valid = 1;
-+    return conf;
-+}
-+
-+static char *
-+ngx_http_sa_init_main(ngx_conf_t *cf, void *data)
-+{
-+    ngx_http_sa_main_conf_t *conf = data;
-+    conf->cache = ngx_sa_cache_create(cf->pool, conf->max, conf->valid,
-+                                     conf->negative_valid);
-+    return conf->cache ? NGX_CONF_OK : NGX_CONF_ERROR;
-+}
-+
-+static void *
-+ngx_http_sa_create_loc(ngx_conf_t *cf)
-+{
-+    ngx_http_sa_loc_conf_t *conf;
-+    conf = ngx_pcalloc(cf->pool, sizeof(*conf));
-+    if (conf == NULL) { return NULL; }
-+    conf->enabled = NGX_CONF_UNSET_UINT;
-+    conf->root = NGX_CONF_UNSET_PTR;
-+    return conf;
-+}
-+
-+static char *
-+ngx_http_sa_merge_loc(ngx_conf_t *cf, void *parent, void *child)
-+{
-+    ngx_http_sa_loc_conf_t *prev = parent, *conf = child;
-+    ngx_http_compile_complex_value_t ccv;
-+    ngx_str_t root = ngx_string("$document_root");
-+
-+    ngx_conf_merge_uint_value(conf->enabled, prev->enabled, 0);
-+    ngx_conf_merge_ptr_value(conf->root, prev->root, NULL);
-+    if (conf->root == NULL) {
-+        conf->root = ngx_pcalloc(cf->pool, sizeof(ngx_http_complex_value_t));
-+        if (conf->root == NULL) { return NGX_CONF_ERROR; }
-+        ngx_memzero(&ccv, sizeof(ccv));
-+        ccv.cf = cf;
-+        ccv.value = &root;
-+        ccv.complex_value = conf->root;
-+        if (ngx_http_compile_complex_value(&ccv) != NGX_OK) {
-+            return NGX_CONF_ERROR;
-+        }
-+    }
-+    return NGX_CONF_OK;
-+}
-+
-+static char *
-+ngx_http_sa_cache(ngx_conf_t *cf, ngx_command_t *cmd, void *data)
-+{
-+    ngx_http_sa_main_conf_t *conf = data;
-+    ngx_str_t *v, s;
-+    ngx_uint_t i, seen;
-+    ngx_int_t n;
-+    time_t t;
-+
-+    if (conf->configured) { return "is duplicate"; }
-+    conf->configured = 1;
-+    v = cf->args->elts;
-+    if (cf->args->nelts == 2 && ngx_strcmp(v[1].data, "off") == 0) {
-+        conf->max = 0;
-+        return NGX_CONF_OK;
-+    }
-+    seen = 0;
-+    for (i = 1; i < cf->args->nelts; i++) {
-+        if (v[i].len > 4 && ngx_strncmp(v[i].data, "max=", 4) == 0) {
-+            if (seen & 1) { return "has duplicate max"; }
-+            seen |= 1;
-+            n = ngx_atoi(v[i].data + 4, v[i].len - 4);
-+            if (n < 1 || n > 65536) { return "requires max between 1 and 65536"; }
-+            conf->max = (ngx_uint_t) n;
-+        } else if (v[i].len > 6 && ngx_strncmp(v[i].data, "valid=", 6) == 0) {
-+            if (seen & 2) { return "has duplicate valid"; }
-+            seen |= 2;
-+            s.data = v[i].data + 6; s.len = v[i].len - 6;
-+            t = ngx_parse_time(&s, 1);
-+            if (t == (time_t) NGX_ERROR) { return "has invalid valid"; }
-+            conf->valid = t;
-+        } else if (v[i].len > 15
-+                   && ngx_strncmp(v[i].data, "negative_valid=", 15) == 0)
-+        {
-+            if (seen & 4) { return "has duplicate negative_valid"; }
-+            seen |= 4;
-+            s.data = v[i].data + 15; s.len = v[i].len - 15;
-+            t = ngx_parse_time(&s, 1);
-+            if (t == (time_t) NGX_ERROR) { return "has invalid negative_valid"; }
-+            conf->negative_valid = t;
-+        } else { return "has an unknown parameter"; }
-+    }
-+    return NGX_CONF_OK;
-+}
 +
 +ngx_flag_t
 +ngx_http_symlink_access_enabled(ngx_http_request_t *r)
 +{
-+    ngx_http_sa_loc_conf_t *conf;
-+    conf = ngx_http_get_module_loc_conf(r, ngx_http_symlink_access_module);
-+    return conf->enabled;
++    ngx_flag_t *enabled = ngx_http_get_module_loc_conf(r, ngx_http_symlink_access_module);
++    return *enabled;
 +}
 +
 +static ngx_int_t
-+ngx_http_sa_prepare(ngx_http_request_t *r, ngx_symlink_access_t *ctx)
++ngx_sa_check(ngx_http_request_t *r, ngx_fd_t fd)
 +{
-+    ngx_http_sa_loc_conf_t  *conf;
-+    ngx_http_sa_main_conf_t *main;
-+    ngx_str_t               root, prefix;
-+
-+    conf = ngx_http_get_module_loc_conf(r, ngx_http_symlink_access_module);
-+    main = ngx_http_get_module_main_conf(r, ngx_http_symlink_access_module);
-+    ctx->pool = r->pool;
-+    ctx->cache = main->cache;
-+    if (ngx_http_complex_value(r, conf->root, &root) != NGX_OK
-+        || root.len == 0 || ngx_strlchr(root.data, root.data + root.len, '\0'))
-+    {
-+        return NGX_OK; /* Invalid identity: deny if a symlink is encountered. */
-+    }
-+    ctx->root.data = ngx_pnalloc(r->pool, root.len + 1);
-+    if (ctx->root.data == NULL) { return NGX_ERROR; }
-+    ngx_memcpy(ctx->root.data, root.data, root.len);
-+    ctx->root.data[root.len] = '\0';
-+    ctx->root.len = root.len;
-+    prefix = ngx_cycle->prefix;
-+    if (ngx_get_full_name(r->pool, &prefix, &ctx->root) != NGX_OK) {
-+        return NGX_ERROR;
-+    }
-+    return NGX_OK;
++    ngx_str_t variable = ngx_string("document_root");
++    ngx_http_variable_value_t *value;
++    ngx_sa_cache_t *cache;
++    ngx_sa_user_t *user;
++    ngx_sa_id_t owner;
++    ngx_file_info_t fi;
++    ngx_fd_t root;
++    u_char *path;
++    ngx_int_t rc;
++    value = ngx_http_get_variable(r, &variable, ngx_hash_key(variable.data, variable.len));
++    if (value == NULL || value->not_found || !value->len
++        || ngx_strlchr(value->data, value->data + value->len, '\0')) { return NGX_DECLINED; }
++    path = ngx_pnalloc(r->pool, value->len + 1);
++    if (path == NULL) { return NGX_DECLINED; }
++    ngx_cpystrn(path, value->data, value->len + 1);
++    root = ngx_open_file(path, NGX_SA_ROOT_MODE, NGX_FILE_OPEN, 0);
++    if (root == NGX_INVALID_FILE) { return NGX_DECLINED; }
++    rc = ngx_fd_info(root, &fi) != NGX_FILE_ERROR && ngx_is_dir(&fi)
++         ? ngx_sa_owner(root, &owner) : NGX_DECLINED;
++    ngx_close_file(root);
++    if (rc != NGX_OK) { return NGX_DECLINED; }
++    cache = ngx_http_get_module_main_conf(r, ngx_http_symlink_access_module);
++    user = ngx_sa_cached_user(cache, r->pool, &owner);
++    if (user == NULL) { return NGX_DECLINED; }
++    rc = ngx_sa_permissions(r->pool, fd, user);
++    return rc >= 0 && (rc & 4) ? NGX_OK : NGX_DECLINED;
 +}
 +
-+/* Private context: nothing is added to upstream structs or retained globally. */
 +ngx_int_t
-+ngx_http_symlink_open_cached_file(ngx_http_request_t *r,
-+    ngx_open_file_cache_t *cache, ngx_str_t *name, ngx_open_file_info_t *of,
-+    ngx_pool_t *pool)
++ngx_http_symlink_open_cached_file(ngx_http_request_t *r, ngx_open_file_cache_t *cache,
++    ngx_str_t *name, ngx_open_file_info_t *of, ngx_pool_t *pool)
 +{
-+    ngx_symlink_access_t     ctx;
-+    ngx_file_info_t          fi;
-+    ngx_fd_t                 fd;
-+    ngx_pool_cleanup_t      *cln;
-+    ngx_pool_cleanup_file_t *file;
-+
++    ngx_flag_t linked = 0, test = of->test_only;
++    ngx_int_t rc;
 +    if (!ngx_http_symlink_access_enabled(r) || of->log) {
 +        return ngx_open_cached_file(cache, name, of, pool);
 +    }
-+    ngx_memzero(&ctx, sizeof(ctx));
-+    of->fd = NGX_INVALID_FILE;
-+    of->err = 0;
-+    of->failed = "symlink_access";
-+    if (ngx_http_sa_prepare(r, &ctx) != NGX_OK) { return NGX_ERROR; }
-+    fd = ngx_symlink_access_open(name, of, &ctx,
-+                                NGX_FILE_RDONLY|NGX_FILE_NONBLOCK,
-+                                NGX_FILE_OPEN, 0, pool->log);
-+    if (fd == NGX_INVALID_FILE) { return NGX_ERROR; }
-+    if (ngx_fd_info(fd, &fi) == NGX_FILE_ERROR) {
-+        of->err = ngx_errno;
-+        ngx_close_file(fd);
-+        return NGX_ERROR;
++    of->test_only = 0; /* Authorize the same descriptor even for try_files probes. */
++    rc = ngx_sa_open(name, of, pool, &linked);
++    of->test_only = test;
++    if (rc != NGX_OK) { return rc; }
++    if (linked && !of->is_dir && (!of->is_file || ngx_sa_check(r, of->fd) != NGX_OK)) {
++        of->err = NGX_EACCES;
++        of->failed = "symlink_access";
++        rc = NGX_ERROR;
 +    }
-+    of->uniq = ngx_file_uniq(&fi);
-+    of->mtime = ngx_file_mtime(&fi);
-+    of->size = ngx_file_size(&fi);
-+    of->fs_size = ngx_file_fs_size(&fi);
-+    of->is_dir = ngx_is_dir(&fi);
-+    of->is_file = ngx_is_file(&fi);
-+    of->is_link = ngx_is_link(&fi);
-+    of->is_exec = ngx_is_exec(&fi);
-+    of->is_directio = 0;
-+    if (of->test_only || of->is_dir) {
-+        ngx_close_file(fd);
-+        return NGX_OK;
++    if ((test || rc != NGX_OK) && of->fd != NGX_INVALID_FILE) {
++        ngx_pool_run_cleanup_file(pool, of->fd);
++        of->fd = NGX_INVALID_FILE;
 +    }
-+    cln = ngx_pool_cleanup_add(pool, sizeof(ngx_pool_cleanup_file_t));
-+    if (cln == NULL) { ngx_close_file(fd); return NGX_ERROR; }
-+    cln->handler = ngx_pool_cleanup_file;
-+    file = cln->data;
-+    file->fd = fd; file->name = name->data; file->log = pool->log;
-+    of->fd = fd;
-+    if (of->read_ahead && of->size > 128 * 1024) {
-+        (void) ngx_read_ahead(fd, of->read_ahead);
-+    }
-+    if (of->directio <= of->size && ngx_directio_on(fd) != NGX_FILE_ERROR) {
-+        of->is_directio = 1;
-+    }
-+    return NGX_OK;
++    return rc;
 +}
 diff --git a/src/http/modules/ngx_http_try_files_module.c b/src/http/modules/ngx_http_try_files_module.c
 index bbdab85..6d77053 100644
@@ -672,576 +706,3 @@ index 1b0e369..5f60b35 100644
 +
  extern ngx_module_t  ngx_http_module;
  
-diff --git a/src/os/unix/ngx_symlink_access_unix.c b/src/os/unix/ngx_symlink_access_unix.c
-new file mode 100644
-index 0000000..9dce0b3
---- /dev/null
-+++ b/src/os/unix/ngx_symlink_access_unix.c
-@@ -0,0 +1,187 @@
-+/* Symlink target access policy. SPDX-License-Identifier: BSD-2-Clause */
-+#include <ngx_config.h>
-+#include <ngx_core.h>
-+#include <ngx_symlink_access.h>
-+#include <pwd.h>
-+#include <grp.h>
-+
-+ngx_int_t
-+ngx_sa_get_path_access(ngx_pool_t *pool, ngx_fd_t fd, ngx_sa_access_t *a)
-+{
-+    struct stat st;
-+    ngx_memzero(a, sizeof(*a));
-+    if (fstat(fd, &st) == -1) { return NGX_ERROR; }
-+    if (ngx_sa_id_copy(pool, &a->owner, &st.st_uid, sizeof(st.st_uid)) != NGX_OK) {
-+        return NGX_ERROR;
-+    }
-+    a->groups = ngx_pcalloc(pool, sizeof(ngx_sa_group_access_t));
-+    if (a->groups == NULL
-+        || ngx_sa_id_copy(pool, &a->groups[0].id, &st.st_gid,
-+                          sizeof(st.st_gid)) != NGX_OK)
-+    {
-+        return NGX_ERROR;
-+    }
-+    a->n = 1;
-+    a->owner_bits = (st.st_mode >> 6) & 7;
-+    a->groups[0].bits = (st.st_mode >> 3) & 7;
-+    a->other_bits = st.st_mode & 7;
-+    a->usable = 1;
-+    return NGX_OK;
-+}
-+
-+ngx_int_t
-+ngx_sa_get_user_groups(ngx_pool_t *pool, ngx_sa_id_t *user,
-+    ngx_sa_id_t **groups, ngx_uint_t *count)
-+{
-+#if (NGX_HAVE_GETGROUPLIST)
-+    uid_t uid;
-+#if defined(__APPLE__)
-+    int *gids;
-+#else
-+    gid_t *gids;
-+#endif
-+    gid_t gid;
-+    struct passwd pw, *result;
-+    char *buf;
-+    size_t size;
-+    int rc, n, i;
-+
-+    *groups = NULL; *count = 0;
-+    if (user->len != sizeof(uid)) { return NGX_DECLINED; }
-+    ngx_memcpy(&uid, user->data, sizeof(uid));
-+    for (size = 4096; size <= 1024 * 1024; size *= 2) {
-+        buf = ngx_alloc(size, pool->log);
-+        if (buf == NULL) { return NGX_ERROR; }
-+        rc = getpwuid_r(uid, &pw, buf, size, &result);
-+        if (rc != ERANGE) { break; }
-+        ngx_free(buf);
-+    }
-+    if (size > 1024 * 1024) { return NGX_DECLINED; }
-+    if (rc != 0 || result == NULL) { ngx_free(buf); return NGX_DECLINED; }
-+    gids = ngx_alloc(NGX_SA_MAX_GROUPS * sizeof(*gids), pool->log);
-+    if (gids == NULL) { ngx_free(buf); return NGX_ERROR; }
-+    n = NGX_SA_MAX_GROUPS;
-+    rc = getgrouplist(pw.pw_name, pw.pw_gid, gids, &n);
-+    ngx_free(buf);
-+    if (rc == -1 || n < 1 || n > NGX_SA_MAX_GROUPS) {
-+        ngx_free(gids); return NGX_DECLINED;
-+    }
-+    *groups = ngx_pcalloc(pool, n * sizeof(ngx_sa_id_t));
-+    if (*groups == NULL) { ngx_free(gids); return NGX_ERROR; }
-+    for (i = 0; i < n; i++) {
-+        gid = (gid_t) gids[i];
-+        if (ngx_sa_id_copy(pool, &(*groups)[i], &gid, sizeof(gid)) != NGX_OK) {
-+            ngx_free(gids); return NGX_ERROR;
-+        }
-+    }
-+    ngx_free(gids);
-+    *count = (ngx_uint_t) n;
-+    return NGX_OK;
-+#else
-+    *groups = NULL; *count = 0;
-+    return NGX_DECLINED;
-+#endif
-+}
-+
-+ngx_fd_t
-+ngx_sa_open_root(ngx_str_t *root)
-+{
-+    ngx_fd_t fd;
-+    struct stat st;
-+    if (root->len == 0) { return NGX_INVALID_FILE; }
-+    fd = ngx_open_file(root->data, NGX_FILE_SEARCH|NGX_FILE_NONBLOCK,
-+                       NGX_FILE_OPEN, 0);
-+    if (fd != NGX_INVALID_FILE && (fstat(fd, &st) == -1 || !S_ISDIR(st.st_mode))) {
-+        ngx_close_file(fd); return NGX_INVALID_FILE;
-+    }
-+    return fd;
-+}
-+
-+ngx_fd_t
-+ngx_symlink_access_open(ngx_str_t *name, ngx_open_file_info_t *of,
-+    ngx_symlink_access_t *ctx, ngx_int_t mode, ngx_int_t create,
-+    ngx_int_t access, ngx_log_t *log)
-+{
-+#if (NGX_HAVE_OPENAT)
-+    ngx_fd_t fd, parent;
-+    char *path, *p, *end;
-+    int flags;
-+    ngx_flag_t linked, last, restricted;
-+    struct stat st, lst;
-+    ngx_err_t err;
-+
-+    fd = NGX_INVALID_FILE;
-+    parent = NGX_AT_FDCWD;
-+    linked = 0;
-+    err = NGX_EACCES;
-+    if (create != NGX_FILE_OPEN || of->log || name->len == 0) { goto failed; }
-+    path = ngx_pnalloc(ctx->pool, name->len + 1);
-+    if (path == NULL) { goto failed; }
-+    ngx_memcpy(path, name->data, name->len);
-+    path[name->len] = '\0';
-+    p = path;
-+    if (*p == '/') {
-+        parent = open("/", NGX_FILE_SEARCH|NGX_FILE_NONBLOCK);
-+        if (parent == NGX_INVALID_FILE) { err = ngx_errno; goto failed; }
-+        while (*p == '/') { p++; }
-+    }
-+    for ( ;; ) {
-+        end = p;
-+        while (*end && *end != '/') { end++; }
-+        last = (*end == '\0');
-+        if (!last) { *end = '\0'; }
-+        flags = last ? (int) mode : NGX_FILE_SEARCH|NGX_FILE_NONBLOCK;
-+        /* A trailing slash is resolved as '.', preserving directory semantics. */
-+        fd = openat(parent, *p ? p : ".", flags | O_NOFOLLOW);
-+        if (fd == NGX_INVALID_FILE) {
-+            err = ngx_errno;
-+            if (err != NGX_ELOOP && err != NGX_ENOTDIR) { goto failed; }
-+            linked = 1;
-+            restricted = (size_t) (p - path) >= of->disable_symlinks_from;
-+            if (restricted && of->disable_symlinks == NGX_DISABLE_SYMLINKS_ON) {
-+                err = NGX_ELOOP; goto failed;
-+            }
-+            fd = openat(parent, *p ? p : ".", flags);
-+            if (fd == NGX_INVALID_FILE) { err = ngx_errno; goto failed; }
-+            if (restricted
-+                && of->disable_symlinks == NGX_DISABLE_SYMLINKS_NOTOWNER)
-+            {
-+                if (fstat(fd, &st) == -1
-+                    || fstatat(parent, p, &lst, AT_SYMLINK_NOFOLLOW) == -1)
-+                {
-+                    err = ngx_errno; goto failed;
-+                }
-+                if (st.st_uid != lst.st_uid) { err = NGX_ELOOP; goto failed; }
-+            }
-+        }
-+        if (fstat(fd, &st) == -1) { err = ngx_errno; goto failed; }
-+        /* SEARCH always includes O_DIRECTORY: O_PATH cannot return a link here. */
-+        if (last) { break; }
-+        if (!S_ISDIR(st.st_mode)) { err = NGX_ENOTDIR; goto failed; }
-+        if (parent != NGX_AT_FDCWD) { ngx_close_file(parent); }
-+        parent = fd;
-+        fd = NGX_INVALID_FILE;
-+        p = end + 1;
-+        while (*p == '/') { p++; }
-+    }
-+    if (linked && !S_ISDIR(st.st_mode)) {
-+        if (!S_ISREG(st.st_mode)
-+            || ngx_sa_check(ctx, fd) != NGX_OK)
-+        {
-+            err = NGX_EACCES; goto failed;
-+        }
-+    }
-+    if (parent != NGX_AT_FDCWD) { ngx_close_file(parent); }
-+    return fd;
-+
-+failed:
-+    if (fd != NGX_INVALID_FILE) { ngx_close_file(fd); }
-+    if (parent != NGX_AT_FDCWD) { ngx_close_file(parent); }
-+    of->err = err;
-+#else
-+    of->err = NGX_EACCES;
-+#endif
-+    of->failed = "symlink_access";
-+    ngx_set_errno(of->err);
-+    return NGX_INVALID_FILE;
-+}
-diff --git a/src/os/win32/ngx_symlink_access_win32.c b/src/os/win32/ngx_symlink_access_win32.c
-new file mode 100644
-index 0000000..8c88bd7
---- /dev/null
-+++ b/src/os/win32/ngx_symlink_access_win32.c
-@@ -0,0 +1,374 @@
-+/* Symlink target access policy. SPDX-License-Identifier: BSD-2-Clause */
-+#include <ngx_config.h>
-+#include <ngx_core.h>
-+#include <ngx_symlink_access.h>
-+#include <aclapi.h>
-+#include <authz.h>
-+#include <winternl.h>
-+#include <winioctl.h>
-+
-+/* Native relative opens keep every path component anchored to a directory. */
-+typedef NTSTATUS (NTAPI *ngx_sa_nt_open_pt)(PHANDLE, ACCESS_MASK,
-+    POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK, PLARGE_INTEGER, ULONG, ULONG,
-+    ULONG, ULONG, PVOID, ULONG);
-+typedef ULONG (WINAPI *ngx_sa_nt_error_pt)(NTSTATUS);
-+
-+static WCHAR *
-+ngx_sa_wide(ngx_pool_t *pool, ngx_str_t *path)
-+{
-+    int n;
-+    WCHAR *w;
-+    if (path->len == 0 || path->len > 32760) { return NULL; }
-+    n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
-+                           (char *) path->data, (int) path->len, NULL, 0);
-+    if (n == 0) { return NULL; }
-+    w = ngx_palloc(pool, (n + 1) * sizeof(WCHAR));
-+    if (w == NULL) { return NULL; }
-+    if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
-+                            (char *) path->data, (int) path->len, w, n))
-+    {
-+        return NULL;
-+    }
-+    w[n] = 0;
-+    return w;
-+}
-+
-+static ngx_int_t
-+ngx_sa_sid_type(ngx_pool_t *pool, PSID sid, SID_NAME_USE *type)
-+{
-+    WCHAR *name, *domain;
-+    DWORD n = 0, d = 0;
-+    LookupAccountSidW(NULL, sid, NULL, &n, NULL, &d, type);
-+    if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || n > 32768 || d > 32768) {
-+        return NGX_DECLINED;
-+    }
-+    name = ngx_palloc(pool, (n + 1) * sizeof(WCHAR));
-+    domain = ngx_palloc(pool, (d + 1) * sizeof(WCHAR));
-+    if (name == NULL || domain == NULL
-+        || !LookupAccountSidW(NULL, sid, name, &n, domain, &d, type))
-+    {
-+        return NGX_DECLINED;
-+    }
-+    return NGX_OK;
-+}
-+
-+ngx_int_t
-+ngx_sa_get_user_groups(ngx_pool_t *pool, ngx_sa_id_t *user,
-+    ngx_sa_id_t **groups, ngx_uint_t *count)
-+{
-+    AUTHZ_RESOURCE_MANAGER_HANDLE rm = NULL;
-+    AUTHZ_CLIENT_CONTEXT_HANDLE ctx = NULL;
-+    LUID luid;
-+    TOKEN_GROUPS *tg;
-+    SID_NAME_USE type;
-+    DWORD size = 0, i, n;
-+    ngx_int_t rc = NGX_DECLINED;
-+
-+    *groups = NULL; *count = 0;
-+    if (!IsValidSid(user->data)
-+        || ngx_sa_sid_type(pool, user->data, &type) != NGX_OK
-+        || type != SidTypeUser)
-+    {
-+        return NGX_DECLINED;
-+    }
-+    ngx_memzero(&luid, sizeof(luid));
-+    if (!AuthzInitializeResourceManager(AUTHZ_RM_FLAG_NO_AUDIT, NULL, NULL,
-+                                       NULL, L"symlink_access", &rm))
-+    {
-+        return NGX_DECLINED;
-+    }
-+    if (!AuthzInitializeContextFromSid(0, user->data, rm, NULL, luid, NULL, &ctx)) {
-+        goto done;
-+    }
-+    AuthzGetInformationFromContext(ctx, AuthzContextInfoGroupsSids, 0, &size, NULL);
-+    if (GetLastError() != ERROR_INSUFFICIENT_BUFFER
-+        || size < sizeof(TOKEN_GROUPS) || size > 1024 * 1024)
-+    {
-+        goto done;
-+    }
-+    tg = ngx_palloc(pool, size);
-+    if (tg == NULL
-+        || !AuthzGetInformationFromContext(ctx, AuthzContextInfoGroupsSids,
-+                                           size, &size, tg)
-+        || tg->GroupCount > NGX_SA_MAX_GROUPS)
-+    {
-+        goto done;
-+    }
-+    *groups = ngx_pcalloc(pool, (tg->GroupCount + 1) * sizeof(ngx_sa_id_t));
-+    if (*groups == NULL) { goto done; }
-+    n = 0;
-+    for (i = 0; i < tg->GroupCount; i++) {
-+        if (!(tg->Groups[i].Attributes & SE_GROUP_ENABLED)
-+            || (tg->Groups[i].Attributes & SE_GROUP_USE_FOR_DENY_ONLY))
-+        {
-+            continue;
-+        }
-+        if (!IsValidSid(tg->Groups[i].Sid)
-+            || ngx_sa_id_copy(pool, &(*groups)[n], tg->Groups[i].Sid,
-+                              GetLengthSid(tg->Groups[i].Sid)) != NGX_OK)
-+        {
-+            goto done;
-+        }
-+        n++;
-+    }
-+    *count = n;
-+    rc = NGX_OK;
-+done:
-+    if (ctx) { AuthzFreeContext(ctx); }
-+    AuthzFreeResourceManager(rm);
-+    return rc;
-+}
-+
-+ngx_int_t
-+ngx_sa_get_path_access(ngx_pool_t *pool, ngx_fd_t fd, ngx_sa_access_t *a)
-+{
-+    PSECURITY_DESCRIPTOR sd = NULL;
-+    PSID owner = NULL, sid;
-+    PACL dacl = NULL;
-+    ACE_HEADER *header;
-+    ACCESS_ALLOWED_ACE *ace;
-+    SID_NAME_USE type;
-+    GENERIC_MAPPING mapping = { FILE_GENERIC_READ, FILE_GENERIC_WRITE,
-+                                FILE_GENERIC_EXECUTE, FILE_ALL_ACCESS };
-+    DWORD i, mask;
-+    ngx_uint_t bits;
-+    ngx_int_t rc = NGX_DECLINED;
-+
-+    ngx_memzero(a, sizeof(*a));
-+    if (GetSecurityInfo(fd, SE_FILE_OBJECT,
-+                        OWNER_SECURITY_INFORMATION|DACL_SECURITY_INFORMATION,
-+                        &owner, NULL, &dacl, NULL, &sd) != ERROR_SUCCESS)
-+    {
-+        return NGX_DECLINED;
-+    }
-+    if (owner == NULL || !IsValidSid(owner)
-+        || ngx_sa_id_copy(pool, &a->owner, owner, GetLengthSid(owner)) != NGX_OK)
-+    {
-+        goto done;
-+    }
-+    if (dacl == NULL) {
-+        a->owner_bits = a->other_bits = 7;
-+        a->usable = 1;
-+        rc = NGX_OK;
-+        goto done;
-+    }
-+    if (!IsValidAcl(dacl) || dacl->AceCount > NGX_SA_MAX_GROUPS) { goto done; }
-+    a->groups = ngx_pcalloc(pool, (dacl->AceCount + 1)
-+                                 * sizeof(ngx_sa_group_access_t));
-+    if (a->groups == NULL) { goto done; }
-+    for (i = 0; i < dacl->AceCount; i++) {
-+        if (!GetAce(dacl, i, (void **) &header)) { goto done; }
-+        if (header->AceFlags & INHERIT_ONLY_ACE) { continue; }
-+        if (header->AceType != ACCESS_ALLOWED_ACE_TYPE) { goto done; }
-+        ace = (ACCESS_ALLOWED_ACE *) header;
-+        sid = (PSID) &ace->SidStart;
-+        if (!IsValidSid(sid)) { goto done; }
-+        mask = ace->Mask;
-+        MapGenericMask(&mask, &mapping);
-+        bits = ((mask & FILE_READ_DATA) ? NGX_SA_READ : 0)
-+               | ((mask & FILE_WRITE_DATA) ? NGX_SA_WRITE : 0)
-+               | ((mask & FILE_EXECUTE) ? NGX_SA_EXECUTE : 0);
-+        if (IsWellKnownSid(sid, WinWorldSid)) {
-+            a->other_bits |= bits;
-+        } else if (EqualSid(sid, owner)) {
-+            a->owner_bits |= bits;
-+        } else {
-+            if (ngx_sa_sid_type(pool, sid, &type) != NGX_OK
-+                || (type != SidTypeGroup && type != SidTypeAlias
-+                    && type != SidTypeWellKnownGroup))
-+            {
-+                goto done;
-+            }
-+            if (ngx_sa_id_copy(pool, &a->groups[a->n].id, sid,
-+                               GetLengthSid(sid)) != NGX_OK)
-+            {
-+                goto done;
-+            }
-+            a->groups[a->n++].bits = bits;
-+        }
-+    }
-+    a->owner_bits |= a->other_bits;
-+    for (i = 0; i < a->n; i++) { a->groups[i].bits |= a->other_bits; }
-+    a->usable = 1;
-+    rc = NGX_OK;
-+done:
-+    LocalFree(sd);
-+    return rc;
-+}
-+
-+ngx_fd_t
-+ngx_sa_open_root(ngx_str_t *root)
-+{
-+    ngx_pool_t *pool;
-+    WCHAR *path;
-+    HANDLE fd = INVALID_HANDLE_VALUE;
-+    BY_HANDLE_FILE_INFORMATION fi;
-+    pool = ngx_create_pool(4096, ngx_cycle->log);
-+    if (pool == NULL) { return fd; }
-+    path = ngx_sa_wide(pool, root);
-+    if (path) {
-+        fd = CreateFileW(path, READ_CONTROL|FILE_READ_ATTRIBUTES,
-+                         FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
-+                         NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
-+        if (fd != INVALID_HANDLE_VALUE
-+            && (!GetFileInformationByHandle(fd, &fi)
-+                || !(fi.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)))
-+        {
-+            CloseHandle(fd); fd = INVALID_HANDLE_VALUE;
-+        }
-+    }
-+    ngx_destroy_pool(pool);
-+    return fd;
-+}
-+
-+static HANDLE
-+ngx_sa_relative(HANDLE parent, WCHAR *part, USHORT bytes, ULONG options,
-+    ACCESS_MASK access, DWORD *error)
-+{
-+    HMODULE dll;
-+    ngx_sa_nt_open_pt openfn;
-+    ngx_sa_nt_error_pt errfn;
-+    UNICODE_STRING name;
-+    OBJECT_ATTRIBUTES oa;
-+    IO_STATUS_BLOCK io;
-+    NTSTATUS status;
-+    HANDLE fd = INVALID_HANDLE_VALUE;
-+
-+    dll = GetModuleHandleW(L"ntdll.dll");
-+    if (dll == NULL) { *error = ERROR_ACCESS_DENIED; return fd; }
-+    /* Copy function pointers without compiler-specific incompatible casts. */
-+    { FARPROC p = GetProcAddress(dll, "NtCreateFile");
-+      ngx_memcpy(&openfn, &p, sizeof(openfn)); }
-+    { FARPROC p = GetProcAddress(dll, "RtlNtStatusToDosError");
-+      ngx_memcpy(&errfn, &p, sizeof(errfn)); }
-+    if (openfn == NULL || errfn == NULL) {
-+        *error = ERROR_ACCESS_DENIED; return fd;
-+    }
-+    name.Buffer = part; name.Length = bytes; name.MaximumLength = bytes;
-+    ngx_memzero(&oa, sizeof(oa));
-+    oa.Length = sizeof(oa);
-+    oa.RootDirectory = parent;
-+    oa.ObjectName = &name;
-+    oa.Attributes = 0x40; /* OBJ_CASE_INSENSITIVE */
-+    status = openfn(&fd, access|SYNCHRONIZE, &oa, &io, NULL, 0,
-+                    FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
-+                    1 /* FILE_OPEN */, options | 0x20 /* FILE_SYNCHRONOUS_IO_NONALERT */,
-+                    NULL, 0);
-+    if (status < 0) { *error = errfn(status); return INVALID_HANDLE_VALUE; }
-+    return fd;
-+}
-+
-+ngx_fd_t
-+ngx_symlink_access_open(ngx_str_t *name, ngx_open_file_info_t *of,
-+    ngx_symlink_access_t *ctx, ngx_int_t mode, ngx_int_t create,
-+    ngx_int_t access, ngx_log_t *log)
-+{
-+    WCHAR *path, *p, *end;
-+    HANDLE parent = INVALID_HANDLE_VALUE, fd = INVALID_HANDLE_VALUE;
-+    DWORD err = ERROR_ACCESS_DENIED, returned, tag;
-+    BY_HANDLE_FILE_INFORMATION fi;
-+    BYTE reparse[MAXIMUM_REPARSE_DATA_BUFFER_SIZE];
-+    ACCESS_MASK desired;
-+    ngx_flag_t linked = 0, last;
-+    size_t n;
-+
-+    if (create != NGX_FILE_OPEN || of->log) { goto failed; }
-+    path = ngx_sa_wide(ctx->pool, name);
-+    if (path == NULL) { goto failed; }
-+    for (p = path; *p; p++) { if (*p == L'/') { *p = L'\\'; } }
-+    n = wcslen(path);
-+    if (n >= 3 && path[1] == L':' && path[2] == L'\\'
-+        && ((path[0] >= L'A' && path[0] <= L'Z')
-+            || (path[0] >= L'a' && path[0] <= L'z')))
-+    {
-+        p = path + 3;
-+    } else if (n > 5 && path[0] == L'\\' && path[1] == L'\\'
-+               && path[2] != L'?' && path[2] != L'.')
-+    {
-+        p = wcschr(path + 2, L'\\');
-+        if (p == NULL || p == path + 2) { goto failed; }
-+        p = wcschr(p + 1, L'\\');
-+        if (p == NULL) { goto failed; }
-+        p++;
-+    } else { goto failed; }
-+    { WCHAR saved = *p;
-+      *p = 0;
-+      parent = CreateFileW(path, FILE_READ_ATTRIBUTES|FILE_TRAVERSE,
-+                          FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
-+                          NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
-+      *p = saved; }
-+    if (parent == INVALID_HANDLE_VALUE) { err = GetLastError(); goto failed; }
-+    if (!*p) { fd = parent; parent = INVALID_HANDLE_VALUE; goto done; }
-+    for ( ;; ) {
-+        end = p;
-+        while (*end && *end != L'\\') { end++; }
-+        last = (*end == 0 || (end[0] == L'\\' && end[1] == 0));
-+        if (end == p || (end - p == 1 && p[0] == L'.')
-+            || (end - p == 2 && p[0] == L'.' && p[1] == L'.'))
-+        {
-+            err = ERROR_ACCESS_DENIED; goto failed;
-+        }
-+        /* Preserve nginx's rejection of streams, device names and trailing dots. */
-+        if (p[end - p - 1] == L'.' || p[end - p - 1] == L' ') {
-+            err = ERROR_ACCESS_DENIED; goto failed;
-+        }
-+        { WCHAR *q;
-+          for (q = p; q < end; q++) {
-+              if (*q == L':' || *q < 32) { err = ERROR_ACCESS_DENIED; goto failed; }
-+          } }
-+        desired = last ? (ACCESS_MASK) mode|READ_CONTROL|FILE_READ_ATTRIBUTES
-+                       : FILE_READ_ATTRIBUTES|FILE_TRAVERSE;
-+        fd = ngx_sa_relative(parent, p, (USHORT) ((end - p) * sizeof(WCHAR)),
-+                              0x00200000 /* FILE_OPEN_REPARSE_POINT */,
-+                              desired, &err);
-+        if (fd == INVALID_HANDLE_VALUE) { goto failed; }
-+        if (!GetFileInformationByHandle(fd, &fi)) { err = GetLastError(); goto failed; }
-+        if (fi.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
-+            if (!DeviceIoControl(fd, FSCTL_GET_REPARSE_POINT, NULL, 0,
-+                                  reparse, sizeof(reparse), &returned, NULL)
-+                || returned < sizeof(DWORD))
-+            {
-+                err = ERROR_ACCESS_DENIED; goto failed;
-+            }
-+            ngx_memcpy(&tag, reparse, sizeof(tag));
-+            if (tag != IO_REPARSE_TAG_SYMLINK && tag != IO_REPARSE_TAG_MOUNT_POINT) {
-+                err = ERROR_ACCESS_DENIED; goto failed;
-+            }
-+            linked = 1;
-+            CloseHandle(fd);
-+            fd = ngx_sa_relative(parent, p, (USHORT) ((end - p) * sizeof(WCHAR)),
-+                                  0, desired, &err);
-+            if (fd == INVALID_HANDLE_VALUE) { goto failed; }
-+            if (!GetFileInformationByHandle(fd, &fi)) { err = GetLastError(); goto failed; }
-+        }
-+        if (last) {
-+            if (*end == L'\\' && !(fi.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
-+                err = ERROR_PATH_NOT_FOUND; goto failed;
-+            }
-+            break;
-+        }
-+        if (!(fi.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
-+            err = ERROR_PATH_NOT_FOUND; goto failed;
-+        }
-+        CloseHandle(parent); parent = fd; fd = INVALID_HANDLE_VALUE;
-+        p = end + 1;
-+    }
-+    if (linked && !(fi.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
-+        && ngx_sa_check(ctx, fd) != NGX_OK)
-+    {
-+        err = ERROR_ACCESS_DENIED; goto failed;
-+    }
-+done:
-+    if (parent != INVALID_HANDLE_VALUE) { CloseHandle(parent); }
-+    return fd;
-+failed:
-+    if (fd != INVALID_HANDLE_VALUE) { CloseHandle(fd); }
-+    if (parent != INVALID_HANDLE_VALUE) { CloseHandle(parent); }
-+    if (linked && err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND) {
-+        err = ERROR_ACCESS_DENIED;
-+    }
-+    of->err = err;
-+    of->failed = "symlink_access";
-+    SetLastError(err);
-+    return INVALID_HANDLE_VALUE;
-+}

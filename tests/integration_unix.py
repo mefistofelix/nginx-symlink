@@ -57,6 +57,8 @@ def main():
         if supplementary is not None:
             link('supplementary', file('supplementary', unknown, supplementary, 0o640))
         for p in (good, bad, world, ownerdeny, groupdeny): link(p.name, p)
+        (unknown_root / 'allow').symlink_to(good)
+        (unknown_root / 'world').symlink_to(world)
         link('chain', root / 'allow')
         link('broken', target / 'missing')
         link('loop', root / 'loop')
@@ -88,7 +90,7 @@ http {{
     uwsgi_temp_path {base}/uwsgi_temp;
     scgi_temp_path {base}/scgi_temp;
     access_log off;
-    symlink_access_cache max=2 valid=1s negative_valid=1s;
+    symlink_access_cache 2 1s;
     open_file_cache max=128 inactive=60s;
     open_file_cache_valid 1h;
     open_file_cache_errors on;
@@ -98,11 +100,11 @@ http {{
         set $site_root {root};
         root $site_root;
         access_log {base}/access-$server_port.log;
-        symlink_access root_owner;
+        symlink_access on;
         location / {{ }}
         location /off/ {{ symlink_access off; alias {root}/; }}
-        location /alias/ {{ alias {root}/; symlink_access_root {root}; }}
-        location /unknown/ {{ alias {root}/; symlink_access_root {unknown_root}; }}
+        location /alias/ {{ alias {root}/; }}
+        location /unknown/ {{ alias {unknown_root}/; }}
         location /try/ {{ alias {root}/; try_files $uri =404; }}
         location = /redirect {{ rewrite ^ /deny last; }}
         location /blocked/ {{ alias {root}/; disable_symlinks on; }}

@@ -19,7 +19,7 @@ for name in ('nginx', 'angie'):
     assert not subprocess.check_output(['git', '-C', str(root / 'upstream' / name),
                                        'diff', '--', *unchanged]), 'Upstream ABI/core changed'
 data = subprocess.check_output(['git', '-C', str(nginx), 'diff', '--binary', '-U2'])
-assert b'ngx_symlink_access.c' in data and b'new file mode' in data
+assert b'ngx_http_symlink_access_module.c' in data and b'new file mode' in data
 patch.write_bytes(data)
 for name in ('nginx', 'angie'):
     repo = root / 'upstream' / name
