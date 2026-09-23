@@ -1,0 +1,46 @@
+name: ci
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: release-${{ github.sha }}
+  cancel-in-progress: false
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows'
+        with:
+          arch: x86
+      - shell: bash
+        run: bash build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ runner.os }}
+          path: dist/*
+          if-no-files-found: error
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd dist
+          sha256sum *.tar.gz *.zip > SHA256SUMS
+          tag="${GITHUB_SHA:0:12}"
+          gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 ||
+            gh release create "$tag" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --draft --title "symlink_access $tag" --notes "nginx 1.31.6: Ubuntu 24.04 x86_64, Windows x86. Angie 1.12.2: Ubuntu 24.04 x86_64. Module parity reports are included. Experimental patch; the requested reduction to 500 lines is pending."
+          gh release upload "$tag" ./* -R "$GITHUB_REPOSITORY" --clobber
+          gh release edit "$tag" -R "$GITHUB_REPOSITORY" --draft=false --prerelease

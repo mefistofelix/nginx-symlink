@@ -1,0 +1,5 @@
+/upstream/
+/.test-windows/
+__pycache__/
+/.build/
+/dist/
