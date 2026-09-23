@@ -84,6 +84,8 @@ for server in (['nginx'] if WIN else ['nginx', 'angie']):
     source_archive = download(spec['source'], server + '.tar.gz')
     extract(source_archive, WORK)
     source = WORK / f'{server}-{version}'
+    # A separate repository prevents git apply from treating .build as a prefix.
+    run(['git', 'init', '-q'], source)
     args = [a for a in reference_args if not a.startswith('--feature-cache=')]
     builddir = next((a.split('=', 1)[1] for a in args if a.startswith('--builddir=')), 'objs')
     if WIN:
@@ -122,6 +124,7 @@ for server in (['nginx'] if WIN else ['nginx', 'angie']):
     (package / 'logs').mkdir()
     (package / 'temp').mkdir()
     shutil.copy2(source / 'LICENSE', package / 'LICENSE')
+    shutil.copy2(ROOT / 'LICENSE', package / 'SYMLINK-ACCESS-LICENSE')
     shutil.copy2(ROOT / 'patches/symlink-access.patch', package / 'symlink-access.patch')
     shutil.copy2(ROOT / 'README.md', package / 'README.md')
     (package / 'official-V.txt').write_text(reference_v)
